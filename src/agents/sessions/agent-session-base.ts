@@ -361,10 +361,28 @@ export abstract class AgentSessionBase {
       await this.runWithSessionWriteSettlement(
         async () => await this.handleAgentEventUnlocked(event),
       );
+      // Supported callbacks can change the current result or register another secret.
+      this.prepareModelVisibleToolResult(event);
       return;
     }
     await this.handleAgentEventUnlocked(event);
   };
+
+  private prepareModelVisibleToolResult(event: AgentEvent): boolean {
+    if (event.type !== "message_end" || event.message.role !== "toolResult") {
+      return false;
+    }
+    let changed = false;
+    event.message.content = event.message.content.map((block) => {
+      if (block.type !== "text") {
+        return block;
+      }
+      const prepared = this.sessionManager.prepareModelVisibleToolText(block);
+      changed ||= prepared.text !== block.text;
+      return prepared;
+    });
+    return changed;
+  }
 
   private async handleAgentEventUnlocked(event: AgentEvent): Promise<void> {
     if (event.type === "agent_start") {
@@ -380,7 +398,9 @@ export abstract class AgentSessionBase {
     const sourceSlots =
       event.type === "message_end" ? takeCodeModeResponseSource(event.message) : undefined;
     // Emit to extensions first
-    const messageChanged = await this.emitExtensionEvent(event);
+    let messageChanged = await this.emitExtensionEvent(event);
+    // Extensions can replace the final result. Protect listeners before publishing it.
+    messageChanged = this.prepareModelVisibleToolResult(event) || messageChanged;
     const publishAfterPersistence = event.type === "message_end" && event.message.role === "user";
 
     // Notify all listeners
@@ -393,6 +413,8 @@ export abstract class AgentSessionBase {
     } else if (!publishAfterPersistence) {
       this.emit(event);
     }
+    // Persist the same prepared bytes after synchronous listener changes.
+    messageChanged = this.prepareModelVisibleToolResult(event) || messageChanged;
 
     // Handle session persistence
     if (event.type === "message_end") {
