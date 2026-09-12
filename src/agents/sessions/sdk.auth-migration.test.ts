@@ -1,8 +1,13 @@
 import { mkdir, rename } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { expectDefined } from "@openclaw/normalization-core";
 import { createAssistantMessageEventStream } from "openclaw/plugin-sdk/llm";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { setRuntimeConfigSnapshot } from "../../config/runtime-snapshot.js";
+import { loadSessionEntry, loadTranscriptEvents } from "../../config/sessions/session-accessor.js";
 import type { Model } from "../../llm/types.js";
+import { inspectOpenClawAgentDatabaseOwner } from "../../state/openclaw-agent-db.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import {
   assertAuthProfileMigrationReady,
@@ -14,6 +19,7 @@ import {
 } from "../auth-profiles/sqlite.js";
 import { createResourceLoader } from "./agent-session-loop-resource-loader.test-support.js";
 import { AuthStorage } from "./auth-storage.js";
+import { ModelRegistry } from "./model-registry.js";
 import { createAgentSession } from "./sdk.js";
 import { SessionManager } from "./session-manager.js";
 import { SettingsManager } from "./settings-manager.js";
@@ -517,4 +523,68 @@ describe("SDK migration guard endpoint context", () => {
       },
     );
   });
+});
+
+const testModel: Model = {
+  id: "test-model",
+  name: "Test Model",
+  api: "openai-responses",
+  provider: "test-provider",
+  baseUrl: "https://example.test",
+  reasoning: false,
+  input: ["text"],
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  contextWindow: 1000,
+  maxTokens: 1000,
+};
+
+describe("SDK installation ownership", () => {
+  it.each(["canonical", "custom"])(
+    "keeps the implicit SDK session with its configured owner in a %s directory",
+    async (layout) => {
+      await withOpenClawTestState(
+        { label: "sdk-install-owner", agentEnv: "clear" },
+        async (state) => {
+          const agentDir =
+            layout === "custom" ? state.statePath("worker-state") : state.agentDir("worker");
+          const homedir = vi.spyOn(os, "homedir").mockReturnValue(state.home);
+          try {
+            await state.writeConfig({
+              agents: { entries: { worker: layout === "custom" ? { agentDir } : {} } },
+              plugins: { enabled: false },
+            });
+            const { session } = await createAgentSession({
+              cwd: state.workspaceDir,
+              model: testModel,
+              resourceLoader: createResourceLoader(),
+              settingsManager: SettingsManager.inMemory(),
+              modelRegistry: ModelRegistry.inMemory(AuthStorage.inMemory()),
+            });
+            try {
+              const target = expectDefined(session.sessionManager.getSessionTarget(), "SDK target");
+              expect(target).toMatchObject({
+                agentId: "worker",
+                sessionKey: `agent:worker:sdk:${target.sessionId}`,
+                storePath: path.join(agentDir, "openclaw-agent.sqlite"),
+              });
+              expect(inspectOpenClawAgentDatabaseOwner(target.storePath)).toMatchObject({
+                status: "owned",
+                agentId: "worker",
+              });
+              expect(loadSessionEntry(target)).toMatchObject({ sessionId: target.sessionId });
+              await expect(loadTranscriptEvents(target)).resolves.toEqual(
+                expect.arrayContaining([
+                  expect.objectContaining({ type: "session", id: target.sessionId }),
+                ]),
+              );
+            } finally {
+              session.dispose();
+            }
+          } finally {
+            homedir.mockRestore();
+          }
+        },
+      );
+    },
+  );
 });
