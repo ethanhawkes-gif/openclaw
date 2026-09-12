@@ -14,6 +14,7 @@ import { resolveChannelDefaultAccountId } from "../channels/plugins/helpers.js";
 import { getChannelPlugin } from "../channels/plugins/registry.js";
 import type { ChannelId } from "../channels/plugins/types.public.js";
 import { migrateLegacySkillWorkshopProposals } from "../commands/doctor-skill-workshop-sqlite.js";
+import { readCurrentConfigForResolution } from "../config/io.runtime.js";
 import { resolveSessionStoreCompatibilityAgentId } from "../config/legacy.default-agent-owner.js";
 import { resolveConfigPath, resolveOAuthDir, resolveStateDir } from "../config/paths.js";
 import { migrateLegacyMainSessionKeys } from "../config/sessions/legacy-main-session-migration.js";
@@ -362,7 +363,10 @@ export async function detectLegacyStateMigrations(params: {
   const stateDir = resolveStateDir(env, homedir);
   const oauthDir = resolveOAuthDir(env, stateDir);
   const detectSessionFiles = params.mode !== "automatic";
-  const installDir = resolveInstallAgentDir(params.cfg, { env, homedir });
+  const installDir = resolveInstallAgentDir(
+    (resolutionEnv) => readCurrentConfigForResolution({ config: params.cfg, env: resolutionEnv }),
+    { env, homedir },
+  );
   const migrationAgentId = installDir.agentId;
   const sessionMigrationAgentId = tryResolveDoctorSessionMigrationAgentId(
     params.cfg,
@@ -3264,7 +3268,11 @@ async function executeLegacyStateMigrations(
       // a configured filesystem alias from the standard target pathname.
       const ownershipAgentId = tryResolveDoctorSessionMigrationAgentId(
         params.cfg,
-        resolveInstallAgentDir(params.cfg, { env, homedir }).agentId,
+        resolveInstallAgentDir(
+          (resolutionEnv) =>
+            readCurrentConfigForResolution({ config: params.cfg, env: resolutionEnv }),
+          { env, homedir },
+        ).agentId,
       );
       sessionStoreOwnership = ownershipAgentId
         ? resolveSessionStoreOwnership({

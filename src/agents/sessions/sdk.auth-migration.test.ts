@@ -1,4 +1,4 @@
-import { mkdir, rename } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
@@ -8,6 +8,7 @@ import { setRuntimeConfigSnapshot } from "../../config/runtime-snapshot.js";
 import { loadSessionEntry, loadTranscriptEvents } from "../../config/sessions/session-accessor.js";
 import type { Model } from "../../llm/types.js";
 import { inspectOpenClawAgentDatabaseOwner } from "../../state/openclaw-agent-db.js";
+import { withEnvAsync } from "../../test-utils/env.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import {
   assertAuthProfileMigrationReady,
@@ -539,6 +540,58 @@ const testModel: Model = {
 };
 
 describe("SDK installation ownership", () => {
+  it.each(["legacy", "environment", "option"])(
+    "creates a session with malformed config and a %s directory",
+    async (selection) => {
+      await withOpenClawTestState(
+        { label: "sdk-invalid-config", agentEnv: "clear" },
+        async (state) => {
+          const agentDir =
+            selection === "legacy"
+              ? path.join(state.home, ".openclaw/agent")
+              : state.statePath("selected-agent");
+          vi.spyOn(os, "homedir").mockReturnValue(state.home);
+          await mkdir(agentDir, { recursive: true });
+          await writeFile(path.join(agentDir, "existing-state.txt"), "SDK state");
+          await writeFile(state.configPath, "{broken config");
+          const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+          const error = vi.spyOn(console, "error").mockImplementation(() => {});
+          await withEnvAsync(
+            { OPENCLAW_AGENT_DIR: selection === "environment" ? agentDir : undefined },
+            async () => {
+              const beforeEnv = { ...process.env };
+              const { session } = await createAgentSession({
+                ...(selection === "option" ? { agentDir } : {}),
+                cwd: state.workspaceDir,
+                model: testModel,
+                resourceLoader: createResourceLoader(),
+                settingsManager: SettingsManager.inMemory(),
+              });
+              try {
+                expect(session.sessionManager.getSessionTarget()?.storePath).toBe(
+                  path.join(agentDir, "openclaw-agent.sqlite"),
+                );
+                expect(await readFile(state.configPath, "utf8")).toBe("{broken config");
+                expect(await readFile(path.join(agentDir, "existing-state.txt"), "utf8")).toBe(
+                  "SDK state",
+                );
+                expect(process.env).toEqual(beforeEnv);
+                expect(
+                  warn.mock.calls.filter(([message]) =>
+                    String(message).includes("default agent directory"),
+                  ),
+                ).toHaveLength(1);
+                expect(error).not.toHaveBeenCalled();
+              } finally {
+                session.dispose();
+              }
+            },
+          );
+        },
+      );
+    },
+  );
+
   it.each(["canonical", "custom"])(
     "keeps the implicit SDK session with its configured owner in a %s directory",
     async (layout) => {

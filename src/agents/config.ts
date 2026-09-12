@@ -111,8 +111,7 @@ export const PACKAGE_MANIFEST_VERSION: string = pkg.version || "0.0.0";
 
 /** Prepare one config, environment, and directory decision for a standalone SDK operation. */
 export function getAgentDirResolution() {
-  const { config, env } = readCurrentConfigForResolution();
-  return { config, env, ...resolveInstallAgentDir(config, { env }) };
+  return resolveInstallAgentDir((env) => readCurrentConfigForResolution({ env }));
 }
 
 /** Standalone SDK default; configured sessions pass their resolved agentDir. */

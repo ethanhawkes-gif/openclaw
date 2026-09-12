@@ -8,6 +8,7 @@ import {
   readStringValue,
 } from "@openclaw/normalization-core/string-coerce";
 import { formatCliCommand } from "../cli/command-format.js";
+import { cloneEnvWithPlatformSemantics } from "../config/config-env-vars.js";
 import { getRetainedLegacyDefaultAgentId } from "../config/legacy.default-agent-owner-state.js";
 import { hasExplicitModelPolicyAllow } from "../config/model-policy-allowlist-migration.js";
 import { resolveStateDir } from "../config/paths.js";
@@ -618,30 +619,64 @@ export function resolveEffectiveAgentDir(
     : path.join(resolveStateDir(env, deps?.homedir), "agents", id, "agent");
 }
 
-// One install decision for Doctor and SDK: environment selection, then the configured owner.
-// Doctor targets targetDir; readDir retains shipped 2026.9.x SDK state until that target's receipt.
+// Environment selection precedes config inspection; unavailable config retains default/legacy access.
+// Doctor and SDK share this decision; shipped 2026.9.x SDK state stays until the target's receipt.
 // Remove the legacy read after this migration ships in a release.
-export function resolveInstallAgentDir(cfg: OpenClawConfig, deps?: AgentDirResolutionEnv) {
-  const env = deps?.env ?? process.env;
+export function resolveInstallAgentDir(
+  cfg:
+    | OpenClawConfig
+    | ((env: NodeJS.ProcessEnv) => { config: OpenClawConfig; env: NodeJS.ProcessEnv }),
+  deps?: AgentDirResolutionEnv,
+) {
+  const baseEnv = cloneEnvWithPlatformSemantics(deps?.env ?? process.env);
   const homedir = deps?.homedir ?? os.homedir;
-  const owner = tryResolveAmbientOwnerAgentId(cfg);
-  const agentId = owner && listAgentIds(cfg).includes(owner) ? owner : undefined;
-  const overrideDir = env.OPENCLAW_AGENT_DIR?.replace(/^~(?=\/|$)/, () => homedir());
-  const targetDir =
-    overrideDir || (agentId ? resolveEffectiveAgentDir(cfg, agentId, deps) : undefined);
+  let loaded: { config: OpenClawConfig; env: NodeJS.ProcessEnv } | undefined;
+  const read = () =>
+    (loaded ??= typeof cfg === "function" ? cfg(baseEnv) : { config: cfg, env: baseEnv });
+  const overrideDir = () =>
+    (loaded?.env ?? baseEnv).OPENCLAW_AGENT_DIR?.replace(/^~(?=\/|$)/, () => homedir());
+  const agentId = () => {
+    const { config } = read();
+    const owner = tryResolveAmbientOwnerAgentId(config);
+    return owner && listAgentIds(config).includes(owner) ? owner : undefined;
+  };
+  const targetDir = () => {
+    const explicit = overrideDir();
+    if (explicit) {
+      return explicit;
+    }
+    const { config, env } = read();
+    const owner = agentId();
+    return (
+      overrideDir() ||
+      (owner ? resolveEffectiveAgentDir(config, owner, { env, homedir }) : undefined)
+    );
+  };
   return {
-    agentId,
-    targetDir,
+    get config() {
+      return read().config;
+    },
+    get env() {
+      return read().env;
+    },
+    get agentId() {
+      return agentId();
+    },
+    get targetDir() {
+      return targetDir();
+    },
     get readDir(): string {
-      if (overrideDir) {
-        return overrideDir;
+      const target = targetDir();
+      const explicit = overrideDir();
+      if (explicit) {
+        return explicit;
       }
       const legacyDir = resolveLegacyStandaloneAgentDir(homedir);
       try {
         if (
-          !isUpdateRehearsalReadOnlyPath(legacyDir, env) &&
+          !isUpdateRehearsalReadOnlyPath(legacyDir, read().env) &&
           fs.readdirSync(legacyDir).length > 0 &&
-          (!targetDir || !hasCompletedLegacyAgentDirMigration(legacyDir, targetDir))
+          (!target || !hasCompletedLegacyAgentDirMigration(legacyDir, target))
         ) {
           return legacyDir;
         }
@@ -650,12 +685,12 @@ export function resolveInstallAgentDir(cfg: OpenClawConfig, deps?: AgentDirResol
           throw error;
         }
       }
-      if (!targetDir) {
+      if (!target) {
         throw new Error(
           "Select an agent owner or set OPENCLAW_AGENT_DIR before resolving the install directory.",
         );
       }
-      return targetDir;
+      return target;
     },
   };
 }

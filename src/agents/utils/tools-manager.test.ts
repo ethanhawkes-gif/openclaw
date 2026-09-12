@@ -1,4 +1,4 @@
-import {
+import fs, {
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -12,6 +12,7 @@ import { dirname, join } from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FileLockOptions } from "../../infra/file-lock.js";
+import { snapshotFiles } from "../../infra/state-migrations.caller-mode.test-helpers.js";
 import { deleteTestEnvValue, setTestEnvValue } from "../../test-utils/env.js";
 
 const fetchWithSsrFGuardMock = vi.hoisted(() => vi.fn());
@@ -188,32 +189,64 @@ describe("ensureTool", () => {
     },
   );
 
-  it("defers config reads until tool use and follows repaired directory configuration", async () => {
-    const root = expectDefined(tempAgentDir, "test root");
-    const configPath = join(root, "openclaw.json");
-    const firstDir = join(root, "first-agent");
-    const secondDir = join(root, "second-agent");
-    vi.spyOn(os, "homedir").mockReturnValue(root);
-    vi.stubEnv("HOME", root);
-    vi.stubEnv("OPENCLAW_HOME", root);
-    vi.stubEnv("OPENCLAW_STATE_DIR", root);
-    vi.stubEnv("OPENCLAW_CONFIG_PATH", configPath);
-    vi.stubEnv("OPENCLAW_AGENT_DIR", "");
-    vi.stubEnv("OPENCLAW_OFFLINE", "1");
-    writeFileSync(configPath, "{broken config");
+  it.each(["malformed", "invalid", "missing", "unreadable"])(
+    "keeps installed tools available with %s config and follows repaired configuration",
+    async (condition) => {
+      const root = expectDefined(tempAgentDir, "test root");
+      const configPath = join(root, "openclaw.json");
+      const firstDir = join(root, "first-agent");
+      const secondDir = join(root, "second-agent");
+      const defaultDir = join(root, "agents/main/agent");
+      vi.spyOn(os, "homedir").mockReturnValue(root);
+      vi.stubEnv("HOME", root);
+      vi.stubEnv("OPENCLAW_HOME", root);
+      vi.stubEnv("OPENCLAW_STATE_DIR", root);
+      vi.stubEnv("OPENCLAW_CONFIG_PATH", configPath);
+      vi.stubEnv("OPENCLAW_AGENT_DIR", firstDir);
+      vi.stubEnv("OPENCLAW_OFFLINE", "1");
+      if (condition === "unreadable") {
+        mkdirSync(configPath);
+      } else if (condition !== "missing") {
+        writeFileSync(
+          configPath,
+          condition === "malformed" ? "{broken config" : '{"gateway":{"port":false}}',
+        );
+      }
+      const binary = process.platform === "win32" ? "fd.exe" : "fd";
+      for (const agentDir of [defaultDir, firstDir, secondDir]) {
+        mkdirSync(join(agentDir, "bin"), { recursive: true });
+        writeFileSync(join(agentDir, "bin", binary), "managed binary");
+      }
+      const { ensureTool } = await import("./tools-manager.js");
+      const { getAgentDir } = await import("../config.js");
+      const read = vi.spyOn(fs, "readFileSync");
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const before = snapshotFiles(root);
+      read.mockClear();
+      expect(getAgentDir()).toBe(firstDir);
+      await expect(ensureTool("fd", true)).resolves.toBe(join(firstDir, "bin", binary));
+      expect(read.mock.calls.some(([file]) => file === configPath)).toBe(false);
+      expect(warn).not.toHaveBeenCalled();
 
-    const { ensureTool } = await import("./tools-manager.js");
-    const { getAgentDir } = await import("../config.js");
-    expect(() => getAgentDir()).toThrow();
-    expect(readFileSync(configPath, "utf8")).toBe("{broken config");
-    const binary = process.platform === "win32" ? "fd.exe" : "fd";
-    for (const agentDir of [firstDir, secondDir]) {
-      mkdirSync(join(agentDir, "bin"), { recursive: true });
-      writeFileSync(join(agentDir, "bin", binary), "managed binary");
-      writeFileSync(configPath, JSON.stringify({ agents: { entries: { main: { agentDir } } } }));
-      await expect(ensureTool("fd", true)).resolves.toBe(join(agentDir, "bin", binary));
-    }
-  });
+      vi.stubEnv("OPENCLAW_AGENT_DIR", "");
+      const beforeEnv = { ...process.env };
+      expect(getAgentDir()).toBe(defaultDir);
+      await expect(ensureTool("fd", true)).resolves.toBe(join(defaultDir, "bin", binary));
+      expect(getAgentDir()).toBe(defaultDir);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("default agent directory"));
+      expect(process.env).toEqual(beforeEnv);
+      expect(snapshotFiles(root)).toEqual(before);
+
+      if (condition === "unreadable") {
+        rmSync(configPath, { recursive: true });
+      }
+      for (const agentDir of [firstDir, secondDir]) {
+        writeFileSync(configPath, JSON.stringify({ agents: { entries: { main: { agentDir } } } }));
+        await expect(ensureTool("fd", true)).resolves.toBe(join(agentDir, "bin", binary));
+      }
+    },
+  );
 
   it("single-flights concurrent installs of the same tool", async () => {
     const { ensureTool } = await import("./tools-manager.js");
