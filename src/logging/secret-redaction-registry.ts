@@ -56,7 +56,7 @@ export function hasRegisteredSecretValuesForRedaction(): boolean {
 /** Replaces registered exact values while preserving the caller's mask convention. */
 export function redactRegisteredSecretValues(
   text: string,
-  mask: (value: string) => string,
+  mask: (value: string, index: number) => string,
 ): string {
   if (!text || registeredValues.size === 0) {
     return text;
@@ -110,7 +110,7 @@ export function redactRegisteredSecretValues(
   let result = "";
   let cursor = 0;
   for (const match of matches) {
-    result += `${text.slice(cursor, match.index)}${mask(match.value)}`;
+    result += `${text.slice(cursor, match.index)}${mask(match.value, match.index)}`;
     cursor = match.index + match.value.length;
   }
   return result + text.slice(cursor);
