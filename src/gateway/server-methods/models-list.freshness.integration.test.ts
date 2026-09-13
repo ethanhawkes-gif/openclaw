@@ -2,7 +2,7 @@ import { once } from "node:events";
 import { createServer, type ServerResponse } from "node:http";
 import { expect, it } from "vitest";
 import type { ModelsListResult } from "../../../packages/gateway-protocol/src/schema/agents-models-skills.js";
-import { withTestTimeout } from "../../../test/helpers/promise.js";
+import { createDeferred, withTestTimeout } from "../../../test/helpers/promise.js";
 import { createOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { disconnectGatewayClient, startGatewayWithClient } from "../test-helpers.e2e.js";
 
@@ -34,6 +34,7 @@ it.each([
     let failSibling = false;
     let advertised = ["original"];
     const held: ServerResponse[] = [];
+    const renewal = createDeferred();
     const reply = (response: ServerResponse) => {
       response.writeHead(fail ? 503 : 200, { "content-type": "application/json" });
       response.end(JSON.stringify(advertised));
@@ -47,6 +48,8 @@ it.each([
       requests++;
       if (hold) {
         held.push(response);
+        // Sibling traffic cannot establish that this provider has an in-flight renewal.
+        renewal.resolve();
       } else {
         reply(response);
       }
@@ -143,14 +146,17 @@ it.each([
         const initialRequests = requests;
         advertised = ["original", "newly-published"];
         hold = true;
-        const renewal = once(endpoint, "request");
         const saved = await withTestTimeout(
           list(),
           1_000,
           "models.list waited for expired provider inventory",
         );
         expect(saved.models.map((row) => row.id)).toEqual(["original"]);
-        await withTestTimeout(renewal, 3_000, "models.list did not refresh the expired provider");
+        await withTestTimeout(
+          renewal.promise,
+          3_000,
+          "models.list did not refresh the expired provider",
+        );
         const concurrent = await withTestTimeout(
           Promise.all([list(), list()]),
           1_000,
