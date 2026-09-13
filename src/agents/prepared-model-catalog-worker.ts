@@ -1,4 +1,7 @@
 /** Runs complete model-catalog discovery outside the Gateway event loop. */
+import fs from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import {
   getConfigResolutionFacts,
   serializeConfigResolutionFacts,
@@ -50,6 +53,10 @@ export type PreparedModelCatalogWorkerInput = Readonly<{
   pluginMetadataSnapshot: Omit<PluginMetadataSnapshot, "normalizePluginId">;
 }>;
 
+export type PreparedModelCatalogWorkerData = PreparedModelCatalogWorkerInput & {
+  sourceCaptureDirectory: string;
+};
+
 type PreparedModelWorkerCommand =
   | Readonly<{ kind: "catalog"; providerIds?: readonly string[] }>
   | Readonly<{
@@ -68,6 +75,7 @@ export type PreparedModelWorkerResult =
       generationFingerprint: string;
       snapshot: ModelCatalogSnapshot;
       runtimeModels: Map<string, Model[]>;
+      providerExpiries: Map<string, number>;
       configuredRuntimeModels: PreparedModelRuntimeCatalogFacts["configuredRuntimeModels"];
       credentials: Readonly<AuthStorageData>;
       providerAuthLabels: ModelCatalogAuthLabels;
@@ -209,6 +217,7 @@ type PreparedModelCatalogWorker = Readonly<{
   loadCatalog: (providerIds?: readonly string[]) => Promise<
     Pick<PreparedModelRuntimeCatalogFacts, "modelCatalog" | "configuredRuntimeModels"> & {
       runtimeModels: Map<string, Model[]>;
+      providerExpiries: Map<string, number>;
     }
   >;
 }>;
@@ -256,10 +265,19 @@ export function createPreparedModelCatalogWorker(
       // Only the lifecycle owner may retire it; crashes close the generation permanently.
       idleTimeoutMs: 0,
       restartOnError: false,
-      workerOptions: {
-        workerData: workerInput,
-        // Establish state/config environment before worker module initialization reads process.env.
-        env: workerInput.input.env,
+      prepareWorker: () => {
+        const directory = fs.mkdtempSync(path.join(tmpdir(), "openclaw-model-catalog-"));
+        return {
+          temporaryDirectory: directory,
+          options: {
+            workerData: {
+              ...workerInput,
+              sourceCaptureDirectory: directory,
+            } satisfies PreparedModelCatalogWorkerData,
+            // Establish state/config environment before module initialization reads process.env.
+            env: workerInput.input.env,
+          },
+        };
       },
       validateResult: (message) => {
         assertCurrent();
@@ -399,6 +417,7 @@ export function createPreparedModelCatalogWorker(
         modelCatalog,
         configuredRuntimeModels: message.configuredRuntimeModels,
         runtimeModels: message.runtimeModels,
+        providerExpiries: message.providerExpiries,
       };
     },
     loadAuth: async ({ providerIds, profileIds }) => {
