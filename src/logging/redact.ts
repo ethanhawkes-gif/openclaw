@@ -887,7 +887,7 @@ export function prepareModelVisibleToolTextBlock<T extends { type: "text"; text:
   }
   const prepared = {
     ...block,
-    text: redactModelVisibleToolPayloadTextWithConfig(block.text, loggingConfig),
+    text: redactModelVisibleSensitiveFieldValueWithConfig("text", block.text, loggingConfig),
   };
   modelVisibleToolTextRedactionState.record(prepared, prepared.text, loggingConfig);
   return prepared;

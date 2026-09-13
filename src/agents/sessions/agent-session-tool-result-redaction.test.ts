@@ -42,15 +42,16 @@ afterEach(resetLogger);
 
 describe("AgentSession model-visible tool-result redaction", () => {
   it.each([
-    { ambientPolicy: "matching", callbackChange: "none" },
-    { ambientPolicy: "different", callbackChange: "none" },
-    { ambientPolicy: "absent", callbackChange: "none" },
-    { ambientPolicy: "matching", callbackChange: "duplicate" },
-    { ambientPolicy: "matching", callbackChange: "late" },
-    { ambientPolicy: "matching", callbackChange: "pattern" },
+    { kind: "opaque", ambientPolicy: "matching", callbackChange: "none" },
+    { kind: "opaque", ambientPolicy: "different", callbackChange: "none" },
+    { kind: "opaque", ambientPolicy: "absent", callbackChange: "none" },
+    { kind: "opaque", ambientPolicy: "matching", callbackChange: "duplicate" },
+    { kind: "opaque", ambientPolicy: "matching", callbackChange: "late" },
+    { kind: "opaque", ambientPolicy: "matching", callbackChange: "pattern" },
+    { kind: "app-password", ambientPolicy: "absent", callbackChange: "none" },
   ] as const)(
-    "applies session policy to first and reopened payloads (ambient=$ambientPolicy, callback=$callbackChange)",
-    async ({ ambientPolicy, callbackChange }) => {
+    "masks $kind in first and reopened payloads (ambient=$ambientPolicy, callback=$callbackChange)",
+    async ({ kind, ambientPolicy, callbackChange }) => {
       const cwd = tempDirs.make("openclaw-tool-redaction-restore-");
       const scope = {
         agentId: "main",
@@ -58,7 +59,10 @@ describe("AgentSession model-visible tool-result redaction", () => {
         sessionKey: "agent:main:redaction-restore",
         storePath: path.join(cwd, "sessions.json"),
       };
-      const config = { logging: { redactPatterns: [String.raw`/opaque\(([^)]+)\)/g`] } };
+      const isAppPassword = kind === "app-password";
+      const config = {
+        logging: { redactPatterns: isAppPassword ? [] : [String.raw`/opaque\(([^)]+)\)/g`] },
+      };
       applyLoggingConfig(
         ambientPolicy === "matching"
           ? config.logging
@@ -66,16 +70,21 @@ describe("AgentSession model-visible tool-result redaction", () => {
             ? { redactPatterns: [String.raw`/public\(([^)]+)\)/g`] }
             : {},
       );
-      const secret = "abcdefghijklmnopqrst";
-      const benignText = "public(uvwxyz0123456789abcdef)";
+      const secret = isAppPassword ? "abcd-efgh-ijkl-mnop" : "abcdefghijklmnopqrst";
+      const benignText =
+        "public(uvwxyz0123456789abcdef) main-test-case-name token = timeObserverToken";
       const unchangedSecret = "unchanged-registry-value";
       if (callbackChange === "duplicate") {
         registerSecretValueForRedaction(unchangedSecret);
       }
       const classifiedByCallback = callbackChange === "late" || callbackChange === "pattern";
       const label = classifiedByCallback ? "unclassified" : "opaque";
-      const rawText = `${label}(${secret}) ${benignText}`;
-      const maskedText = `${label}(abcdef…qrst) ${benignText}`;
+      const rawValue = isAppPassword ? `standalone app password ${secret}` : `${label}(${secret})`;
+      const maskedValue = isAppPassword
+        ? "standalone app password abcd-e…mnop"
+        : `${label}(abcdef…qrst)`;
+      const rawText = `${rawValue} ${benignText}`;
+      const maskedText = `${maskedValue} ${benignText}`;
       await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });
       const manager = guardSessionManager(SessionManager.open(scope, cwd), { config });
       const customTools = toToolDefinitions([
@@ -137,11 +146,11 @@ describe("AgentSession model-visible tool-result redaction", () => {
       try {
         await session.prompt("Run lookup.");
         const admittedText = currentToolText;
-        expect(listenerToolText === (classifiedByCallback ? rawText : maskedText)).toBe(true);
-        expect(admittedText === maskedText).toBe(true);
+        expect.soft(listenerToolText === (classifiedByCallback ? rawText : maskedText)).toBe(true);
+        expect.soft(admittedText === maskedText).toBe(true);
         expect(providerPayload).toBeDefined();
-        expect(JSON.stringify(providerPayload).includes(maskedText)).toBe(true);
-        expect(JSON.stringify(providerPayload).includes(secret)).toBe(false);
+        expect.soft(JSON.stringify(providerPayload).includes(maskedText)).toBe(true);
+        expect.soft(JSON.stringify(providerPayload).includes(secret)).toBe(false);
         session.dispose();
         const databasePath = resolveSqliteTargetFromSessionStorePath(scope.storePath).path;
         expect(closeOpenClawAgentDatabaseByPath(databasePath)).toBe(true);
