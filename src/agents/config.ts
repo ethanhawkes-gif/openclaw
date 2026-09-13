@@ -8,7 +8,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readCurrentConfigForResolution } from "../config/io.runtime.js";
-import { resolveInstallAgentDir } from "./agent-scope-config.js";
+import { resolveInstallAgentDir } from "./install-agent-dir.js";
 
 // =============================================================================
 // Package Detection
