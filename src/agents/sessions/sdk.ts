@@ -7,7 +7,6 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { clampThinkingLevel } from "@openclaw/ai/internal/runtime";
 import { resolveThinkingDefaultForModel } from "../../auto-reply/thinking.js";
-import { readCurrentConfigForResolution } from "../../config/io.runtime.js";
 import { createSessionEntryWithTranscript } from "../../config/sessions/session-accessor.js";
 import { bindStreamLlmRuntime } from "../../llm/model-runtime-binding.js";
 import type { Message, Model } from "../../llm/types.js";
@@ -272,24 +271,15 @@ async function createAgentSessionImpl(
   cleanupProviderSessionResourcesOnDispose = true,
 ): Promise<CreateAgentSessionResult> {
   const cwd = options.cwd ?? options.sessionManager?.getCwd() ?? process.cwd();
-  let agentDir: string;
-  let install: ReturnType<typeof getAgentDirResolution> | undefined;
-  if (options.agentDir !== undefined) {
-    agentDir = options.agentDir;
-  } else {
-    install = getAgentDirResolution();
-    agentDir = install.readDir;
-    if (install.agentId) {
-      registerResolvedAgentDir({ agentId: install.agentId, agentDir, env: install.env });
-    }
+  const install = getAgentDirResolution(options.agentDir);
+  const { dir: agentDir } = install.directory;
+  if (options.agentDir === undefined && install.directory.owner) {
+    registerResolvedAgentDir({ agentId: install.directory.owner, agentDir, env: install.env });
   }
   let resourceLoader = options.resourceLoader;
 
   // Use provided or create AuthStorage and ModelRegistry
-  const config =
-    options.authStorage && options.modelRegistry
-      ? undefined
-      : (install?.config ?? readCurrentConfigForResolution().config);
+  const config = options.authStorage && options.modelRegistry ? undefined : install.config;
   const authStorage = options.authStorage ?? AuthStorage.forAgent(agentDir, config);
   const modelRegistry =
     options.modelRegistry ??
@@ -297,7 +287,7 @@ async function createAgentSessionImpl(
 
   const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
   const sessionManager =
-    options.sessionManager ?? (await createDefaultSdkSessionManager(cwd, agentDir, install));
+    options.sessionManager ?? (await createDefaultSdkSessionManager(cwd, install));
 
   if (!resourceLoader) {
     resourceLoader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
@@ -565,10 +555,9 @@ async function createAgentSessionImpl(
 
 async function createDefaultSdkSessionManager(
   cwd: string,
-  agentDir: string,
-  install?: { agentId?: string; env: NodeJS.ProcessEnv },
+  install: ReturnType<typeof getAgentDirResolution>,
 ): Promise<SessionManager> {
-  const agentId = install ? install.agentId : "main";
+  const { dir: agentDir, owner: agentId } = install.directory;
   if (!agentId) {
     throw new Error(
       "Select an agent owner or provide a sessionManager before creating an SDK session.",
@@ -580,12 +569,9 @@ async function createDefaultSdkSessionManager(
     sessionId,
     sessionKey: `agent:${agentId}:sdk:${sessionId}`,
     storePath: join(agentDir, "openclaw-agent.sqlite"),
-    ...(install ? { env: install.env } : {}),
+    env: install.env,
   };
-  if (install) {
-    // Custom directories have no path-derived owner; establish the selected schema owner first.
-    openOpenClawAgentDatabase({ agentId, env: install.env, path: target.storePath });
-  }
+  openOpenClawAgentDatabase({ agentId, env: install.env, path: target.storePath });
   const created = await createSessionEntryWithTranscript(
     target,
     () => ({

@@ -24,6 +24,7 @@ import {
 } from "../infra/state-migrations.agent-dir-receipt.js";
 import { isUpdateRehearsalReadOnlyPath } from "../infra/update-rehearsal-paths.js";
 import { LEGACY_IMPLICIT_AGENT_ID, normalizeAgentId } from "../routing/session-key.js";
+import { inspectOpenClawAgentDatabaseOwner } from "../state/openclaw-agent-db-lifecycle.js";
 import { resolveUserPath } from "../utils.js";
 import { registerResolvedAgentDir } from "./agent-dir-registry.js";
 import { resolveDefaultAgentWorkspaceDir } from "./workspace-default.js";
@@ -619,14 +620,20 @@ export function resolveEffectiveAgentDir(
     : path.join(resolveStateDir(env, deps?.homedir), "agents", id, "agent");
 }
 
-// Environment selection precedes config inspection; unavailable config retains default/legacy access.
-// Doctor and SDK share this decision; shipped 2026.9.x SDK state stays until the target's receipt.
-// Remove the legacy read after this migration ships in a release.
+type InstallAgentDirectory = {
+  dir: string;
+  readonly owner: string | undefined;
+  migrationState: "legacy" | "current" | "explicit";
+};
+
+// Shipped 2026.9.x SDK directories retain their recorded database owner until Doctor migrates them.
+// Explicit directory lookup precedes config inspection; the configured migration target is not ownership.
+// Remove the legacy read after the migration ships in a release.
 export function resolveInstallAgentDir(
   cfg:
     | OpenClawConfig
     | ((env: NodeJS.ProcessEnv) => { config: OpenClawConfig; env: NodeJS.ProcessEnv }),
-  deps?: AgentDirResolutionEnv,
+  deps?: AgentDirResolutionEnv & { agentDir?: string },
 ) {
   const baseEnv = cloneEnvWithPlatformSemantics(deps?.env ?? process.env);
   const homedir = deps?.homedir ?? os.homedir;
@@ -634,7 +641,9 @@ export function resolveInstallAgentDir(
   const read = () =>
     (loaded ??= typeof cfg === "function" ? cfg(baseEnv) : { config: cfg, env: baseEnv });
   const overrideDir = () =>
-    (loaded?.env ?? baseEnv).OPENCLAW_AGENT_DIR?.replace(/^~(?=\/|$)/, () => homedir());
+    deps?.agentDir ??
+    ((loaded?.env ?? baseEnv).OPENCLAW_AGENT_DIR?.replace(/^~(?=\/|$)/, () => homedir()) ||
+      undefined);
   const agentId = () => {
     const { config } = read();
     const owner = tryResolveAmbientOwnerAgentId(config);
@@ -642,7 +651,7 @@ export function resolveInstallAgentDir(
   };
   const targetDir = () => {
     const explicit = overrideDir();
-    if (explicit) {
+    if (explicit !== undefined) {
       return explicit;
     }
     const { config, env } = read();
@@ -652,6 +661,62 @@ export function resolveInstallAgentDir(
       (owner ? resolveEffectiveAgentDir(config, owner, { env, homedir }) : undefined)
     );
   };
+  const select = (
+    dir: string,
+    migrationState: InstallAgentDirectory["migrationState"],
+  ): InstallAgentDirectory => {
+    let recorded: { owner: string | undefined } | undefined;
+    const readOwner = () => {
+      const databasePath = path.join(dir, "openclaw-agent.sqlite");
+      if (fs.existsSync(databasePath)) {
+        const inspection = inspectOpenClawAgentDatabaseOwner(databasePath);
+        if (inspection.status !== "owned") {
+          throw new Error(
+            `Cannot read the agent database owner at ${databasePath}. Run openclaw doctor --fix.`,
+          );
+        }
+        return inspection.agentId;
+      }
+      return migrationState === "legacy" || deps?.agentDir !== undefined
+        ? LEGACY_IMPLICIT_AGENT_ID
+        : agentId();
+    };
+    return {
+      dir,
+      migrationState,
+      get owner() {
+        return (recorded ??= { owner: readOwner() }).owner;
+      },
+    };
+  };
+  let directory: InstallAgentDirectory | undefined;
+  const resolveDirectory = (): InstallAgentDirectory => {
+    const target = targetDir();
+    const explicit = overrideDir();
+    if (explicit !== undefined) {
+      return select(explicit, "explicit");
+    }
+    const legacyDir = resolveLegacyStandaloneAgentDir(homedir);
+    try {
+      if (
+        !isUpdateRehearsalReadOnlyPath(legacyDir, read().env) &&
+        fs.readdirSync(legacyDir).length > 0 &&
+        (!target || !hasCompletedLegacyAgentDirMigration(legacyDir, target))
+      ) {
+        return select(legacyDir, "legacy");
+      }
+    } catch (error) {
+      if (!isMissingPathError(error)) {
+        throw error;
+      }
+    }
+    if (!target) {
+      throw new Error(
+        "Select an agent owner or set OPENCLAW_AGENT_DIR before resolving the install directory.",
+      );
+    }
+    return select(target, "current");
+  };
   return {
     get config() {
       return read().config;
@@ -659,38 +724,12 @@ export function resolveInstallAgentDir(
     get env() {
       return read().env;
     },
-    get agentId() {
-      return agentId();
+    get migrationTarget() {
+      const dir = targetDir();
+      return dir === undefined ? undefined : { dir, owner: agentId() };
     },
-    get targetDir() {
-      return targetDir();
-    },
-    get readDir(): string {
-      const target = targetDir();
-      const explicit = overrideDir();
-      if (explicit) {
-        return explicit;
-      }
-      const legacyDir = resolveLegacyStandaloneAgentDir(homedir);
-      try {
-        if (
-          !isUpdateRehearsalReadOnlyPath(legacyDir, read().env) &&
-          fs.readdirSync(legacyDir).length > 0 &&
-          (!target || !hasCompletedLegacyAgentDirMigration(legacyDir, target))
-        ) {
-          return legacyDir;
-        }
-      } catch (error) {
-        if (!isMissingPathError(error)) {
-          throw error;
-        }
-      }
-      if (!target) {
-        throw new Error(
-          "Select an agent owner or set OPENCLAW_AGENT_DIR before resolving the install directory.",
-        );
-      }
-      return target;
+    get directory() {
+      return (directory ??= resolveDirectory());
     },
   };
 }

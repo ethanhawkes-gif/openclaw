@@ -363,11 +363,11 @@ export async function detectLegacyStateMigrations(params: {
   const stateDir = resolveStateDir(env, homedir);
   const oauthDir = resolveOAuthDir(env, stateDir);
   const detectSessionFiles = params.mode !== "automatic";
-  const installDir = resolveInstallAgentDir(
+  const migrationTarget = resolveInstallAgentDir(
     (resolutionEnv) => readCurrentConfigForResolution({ config: params.cfg, env: resolutionEnv }),
     { env, homedir },
-  );
-  const migrationAgentId = installDir.agentId;
+  ).migrationTarget;
+  const migrationAgentId = migrationTarget?.owner;
   const sessionMigrationAgentId = tryResolveDoctorSessionMigrationAgentId(
     params.cfg,
     migrationAgentId,
@@ -462,7 +462,7 @@ export async function detectLegacyStateMigrations(params: {
       ),
     );
 
-  const targetAgentDir = installDir.targetDir;
+  const targetAgentDir = migrationTarget?.dir;
   const targetAgentIdentity = targetAgentDir
     ? resolveIdentityPathViaExistingAncestorSync(targetAgentDir)
     : undefined;
@@ -3272,7 +3272,7 @@ async function executeLegacyStateMigrations(
           (resolutionEnv) =>
             readCurrentConfigForResolution({ config: params.cfg, env: resolutionEnv }),
           { env, homedir },
-        ).agentId,
+        ).migrationTarget?.owner,
       );
       sessionStoreOwnership = ownershipAgentId
         ? resolveSessionStoreOwnership({

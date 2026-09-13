@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { resolveInstallAgentDir } from "../agents/agent-scope-config.js";
 import type { SessionEntry } from "../config/sessions.js";
 import { buildAgentMainSessionKey } from "../routing/session-key.js";
 import { readExistingAgentSchemaMeta } from "../state/openclaw-agent-db-schema-helpers.js";
@@ -399,6 +400,7 @@ export async function migrateLegacyAgentDir(
 ): Promise<MigrationMessages> {
   const changes: string[] = [];
   const warnings: string[] = [];
+  const deferred: NonNullable<MigrationMessages["deferred"]> = [];
   const { targetDir, sources } = detected.agentDir;
   if (!detected.agentDir.hasLegacy || !targetDir) {
     return { changes, warnings };
@@ -421,7 +423,7 @@ export async function migrateLegacyAgentDir(
         source.isFile() &&
         target.isFile() &&
         source.size === target.size &&
-        // SQLite databases and sidecars remain with the database migration owner.
+        // Never discard SQLite recovery files based on a per-file byte comparison.
         !relative.startsWith(LEGACY_AGENT_DATABASE_BASENAME) &&
         fs.readFileSync(from).equals(fs.readFileSync(to))
       ) {
@@ -432,14 +434,36 @@ export async function migrateLegacyAgentDir(
     }
 
     try {
+      const sourceRoot = fs.realpathSync(legacyDir);
+      if (!fs.lstatSync(legacyDir).isDirectory() || !isPathInside(boundaryRoot, sourceRoot)) {
+        return {
+          changes,
+          warnings: [
+            ...warnings,
+            `Refused legacy agent migration from ${legacyDir}: source escaped its declared directory boundary.`,
+          ],
+        };
+      }
+      if (migrationFileExists(path.join(legacyDir, LEGACY_AGENT_DATABASE_BASENAME))) {
+        const { owner } = resolveInstallAgentDir({}, { agentDir: legacyDir }).directory;
+        if (owner && owner !== detected.targetAgentId) {
+          deferred.push({
+            reason: "owner-mismatch",
+            recordedOwner: owner,
+            configuredOwner: detected.targetAgentId,
+            path: legacyDir,
+          });
+          warnings.push(
+            `Deferred legacy agent migration at ${legacyDir}: recorded owner ${owner} differs from configured owner ${detected.targetAgentId}. Keep using the existing store; ownership transfer requires a later release.`,
+          );
+          continue;
+        }
+      }
       const stateRoot = fs.realpathSync(detected.stateDir);
       ensureMigrationDir(targetDir);
-      const sourceRoot = fs.realpathSync(legacyDir);
       const targetRoot = fs.realpathSync(targetDir);
       if (
-        !fs.lstatSync(legacyDir).isDirectory() ||
         !fs.lstatSync(targetDir).isDirectory() ||
-        !isPathInside(boundaryRoot, sourceRoot) ||
         isPathInside(sourceRoot, targetRoot) ||
         isPathInside(targetRoot, sourceRoot) ||
         sourceRoot === targetRoot
@@ -487,7 +511,12 @@ export async function migrateLegacyAgentDir(
     }
   }
 
-  return { changes, warnings, warningDisposition: "recoverable" };
+  return {
+    changes,
+    warnings,
+    warningDisposition: "recoverable",
+    ...(deferred.length > 0 ? ({ outcome: "deferred", deferred } as const) : {}),
+  };
 }
 
 export function legacyAgentQuarantineNotices(

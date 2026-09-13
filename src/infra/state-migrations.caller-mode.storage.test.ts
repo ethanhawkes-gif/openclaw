@@ -257,7 +257,7 @@ describe("legacy state migration caller storage", () => {
             env,
             homedir: () => fixture.stateDir,
           },
-        ).readDir,
+        ).directory.dir,
       ).toBe(canonicalDir);
     },
   );

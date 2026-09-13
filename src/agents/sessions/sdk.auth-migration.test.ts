@@ -6,8 +6,14 @@ import { createAssistantMessageEventStream } from "openclaw/plugin-sdk/llm";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { setRuntimeConfigSnapshot } from "../../config/runtime-snapshot.js";
 import { loadSessionEntry, loadTranscriptEvents } from "../../config/sessions/session-accessor.js";
+import { snapshotFiles } from "../../infra/state-migrations.caller-mode.test-helpers.js";
+import { autoMigrateLegacyState } from "../../infra/state-migrations.doctor.js";
 import type { Model } from "../../llm/types.js";
-import { inspectOpenClawAgentDatabaseOwner } from "../../state/openclaw-agent-db.js";
+import { EMPTY_LEGACY_SESSION_SURFACES } from "../../plugins/legacy-session-surfaces.types.js";
+import {
+  closeOpenClawAgentDatabasesForTest,
+  inspectOpenClawAgentDatabaseOwner,
+} from "../../state/openclaw-agent-db.js";
 import { withEnvAsync } from "../../test-utils/env.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import {
@@ -540,6 +546,122 @@ const testModel: Model = {
 };
 
 describe("SDK installation ownership", () => {
+  it.each([
+    { configuredOwner: "worker", doctor: false },
+    { configuredOwner: "worker", doctor: true },
+    { configuredOwner: "main", doctor: true },
+  ])(
+    "preserves existing standalone sessions (configured owner: $configuredOwner, Doctor: $doctor)",
+    async ({ configuredOwner, doctor }) => {
+      await withOpenClawTestState(
+        { label: "sdk-legacy-owner", layout: "split", agentEnv: "clear" },
+        async (state) => {
+          vi.spyOn(os, "homedir").mockReturnValue(state.home);
+          const legacyDir = path.join(state.home, ".openclaw", "agent");
+          const options = {
+            cwd: state.workspaceDir,
+            model: testModel,
+            resourceLoader: createResourceLoader(),
+            settingsManager: SettingsManager.inMemory(),
+            authStorage: AuthStorage.inMemory(),
+            modelRegistry: ModelRegistry.inMemory(AuthStorage.inMemory()),
+          };
+          const existing = await createAgentSession({ ...options, agentDir: legacyDir });
+          const original = expectDefined(
+            existing.session.sessionManager.getSessionTarget(),
+            "legacy SDK target",
+          );
+          existing.session.dispose();
+          closeOpenClawAgentDatabasesForTest();
+          expect(inspectOpenClawAgentDatabaseOwner(original.storePath)).toEqual({
+            status: "owned",
+            agentId: "main",
+          });
+
+          const binary = process.platform === "win32" ? "fd.exe" : "fd";
+          await mkdir(path.join(legacyDir, "bin"));
+          await writeFile(path.join(legacyDir, "bin", binary), "installed SDK tool");
+          await writeFile(
+            path.join(legacyDir, "models.json"),
+            JSON.stringify({
+              providers: {
+                [testModel.provider]: {
+                  baseUrl: testModel.baseUrl,
+                  api: testModel.api,
+                  models: [testModel],
+                },
+              },
+            }),
+          );
+
+          const before = snapshotFiles(legacyDir);
+          const cfg = {
+            agents: { entries: { [configuredOwner]: {} } },
+            plugins: { enabled: false },
+          };
+          await state.writeConfig(cfg);
+          if (doctor) {
+            const result = await autoMigrateLegacyState({
+              cfg,
+              homedir: () => state.home,
+              doctorOnlyStateMigrations: true,
+              legacySessionSurfaces: EMPTY_LEGACY_SESSION_SURFACES,
+            });
+            const receipt = result.stepReceipts.find((entry) => entry.id === "agent-dir");
+            if (configuredOwner === "worker") {
+              expect(receipt).toMatchObject({
+                outcome: "deferred",
+                deferred: [
+                  {
+                    reason: "owner-mismatch",
+                    recordedOwner: "main",
+                    configuredOwner,
+                    path: legacyDir,
+                  },
+                ],
+              });
+              expect(receipt?.warnings).toEqual(
+                expect.arrayContaining([expect.stringContaining("Keep using the existing store")]),
+              );
+              expect(snapshotFiles(legacyDir)).toEqual(before);
+              expect(result.stepReceipts.some((entry) => entry.outcome === "refused")).toBe(false);
+            } else {
+              expect(receipt?.outcome).toBe("completed");
+            }
+            closeOpenClawAgentDatabasesForTest();
+          }
+
+          const { session } = await createAgentSession(options);
+          try {
+            const target = expectDefined(
+              session.sessionManager.getSessionTarget(),
+              "resolved SDK target",
+            );
+            expect(target.agentId).toBe("main");
+            const activeDir =
+              doctor && configuredOwner === "main" ? state.agentDir("main") : legacyDir;
+            expect(target.storePath).toBe(path.join(activeDir, "openclaw-agent.sqlite"));
+            const { ensureTool } = await import("../utils/tools-manager.js");
+            await expect(ensureTool("fd", true)).resolves.toBe(path.join(activeDir, "bin", binary));
+            const discovered = ModelRegistry.create(AuthStorage.inMemory());
+            expect(discovered.find(testModel.provider, testModel.id)).toMatchObject({
+              id: testModel.id,
+            });
+            const retained = { ...original, storePath: target.storePath, agentId: target.agentId };
+            expect(loadSessionEntry(retained)).toMatchObject({ sessionId: original.sessionId });
+            await expect(loadTranscriptEvents(retained)).resolves.toEqual(
+              expect.arrayContaining([
+                expect.objectContaining({ type: "session", id: original.sessionId }),
+              ]),
+            );
+          } finally {
+            session.dispose();
+          }
+        },
+      );
+    },
+  );
+
   it.each(["legacy", "environment", "option"])(
     "creates a session with malformed config and a %s directory",
     async (selection) => {

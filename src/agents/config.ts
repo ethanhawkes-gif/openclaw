@@ -110,13 +110,13 @@ export const CONFIG_DIR_NAME: string = pkg.openclawConfig?.configDir || ".opencl
 export const PACKAGE_MANIFEST_VERSION: string = pkg.version || "0.0.0";
 
 /** Prepare one config, environment, and directory decision for a standalone SDK operation. */
-export function getAgentDirResolution() {
-  return resolveInstallAgentDir((env) => readCurrentConfigForResolution({ env }));
+export function getAgentDirResolution(agentDir?: string) {
+  return resolveInstallAgentDir((env) => readCurrentConfigForResolution({ env }), { agentDir });
 }
 
 /** Standalone SDK default; configured sessions pass their resolved agentDir. */
 export function getAgentDir(): string {
-  return getAgentDirResolution().readDir;
+  return getAgentDirResolution().directory.dir;
 }
 
 /** Get path to managed binaries directory (fd, rg) */
