@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { afterAll, describe, expect, it, vi } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import {
   appendTranscriptMessage,
   applySessionEntryLifecycleMutation,
@@ -39,13 +39,15 @@ function emptyFinalizationHarness() {
     id: "internal-session-finalization-test",
     label: "Internal session finalization test",
     supports: () => ({ supported: true as const }),
-    runAttempt: vi.fn(),
-    finalizeSettledTurn: vi.fn(async () => {
+    runAttempt: async () => {
+      throw new Error("runAttempt is not used by this finalization fixture");
+    },
+    finalizeSettledTurn: async () => {
       throw new EmptySettledTurnFinalizationError({
         assistant,
         usage: assistant.usage,
       });
-    }),
+    },
   };
 }
 
@@ -141,6 +143,11 @@ async function createInternalFallbackFixture(input: {
   }
   const attempt = createSettledToolUseAttempt(target);
   const request = createSettledFinalizationTestInput(attempt, admittedRunContext);
+  // This fixture exercises transcript custody, not bundled provider policy loading.
+  // Keep terminal metadata on a synthetic provider so the test remains hermetic.
+  request.terminalBase.provider = "test-provider";
+  request.terminalBase.model = "test-model";
+  request.terminalBase.activeErrorContext = { provider: "test-provider", model: "test-model" };
   request.initial.sessionIdUsed = target.sessionId;
   request.initial.sessionFileUsed = target.sessionFile;
   request.terminalBase.runParams = {
