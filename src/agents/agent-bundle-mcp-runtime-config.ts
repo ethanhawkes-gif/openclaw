@@ -118,7 +118,7 @@ export function loadSessionMcpConfig(params: {
   const fingerprintServers = params.redactConnectionServerNames?.size
     ? redactMcpServersForFingerprint(mcpServers, params.redactConnectionServerNames)
     : mcpServers;
-  const result = {
+  return {
     safeServerNamesByServer,
     loaded: {
       ...loaded,
@@ -134,8 +134,6 @@ export function loadSessionMcpConfig(params: {
       mcpToolsDeny,
     }),
   };
-  // Launch normalization is session-owned; never expose cached package facts or user config.
-  return structuredClone(result);
 }
 
 /**
@@ -169,19 +167,4 @@ export function resolveSessionMcpConfigSummary(params: {
     safeServerNamesByServer,
   });
   return { fingerprint, serverNames };
-}
-
-/** Reads the enabled static MCP server set without opening transports or listing tools. */
-export function resolveStaticSessionMcpServerNames(params: {
-  workspaceDir: string;
-  cfg?: OpenClawConfig;
-  manifestRegistry?: Pick<PluginManifestRegistry, "plugins">;
-  toolOverrides?: Pick<SessionToolOverrides, "mcpServers" | "mcpToolsDeny">;
-}): string[] {
-  const { loaded } = loadSessionMcpConfig({
-    ...params,
-    logDiagnostics: false,
-  });
-  const { staticServers } = partitionMcpServersByConnectionScope(loaded.mcpServers);
-  return Object.keys(staticServers).toSorted((left, right) => left.localeCompare(right));
 }

@@ -45,9 +45,7 @@ export type GatewayServerMutableState = {
   tailscaleCleanup: (() => Promise<void>) | null;
   readonly postReadySidecars: GatewaySidecarStopOwner;
   readonly gatewayLifetimeSidecars: GatewaySidecarStopOwner;
-  skillsRefreshTimer: ReturnType<typeof setTimeout> | null;
-  skillsRefreshDelayMs: number;
-  skillsChangeUnsub: () => Promise<void>;
+  skillsChangeUnsub: (options?: { exitAfterClose?: boolean }) => Promise<void>;
   channelHealthMonitor: ChannelHealthMonitor | null;
   configReloader: GatewayConfigReloaderHandle;
   reconcileAuditPolicy: ((config: OpenClawConfig) => void) | null;
@@ -69,8 +67,6 @@ export function createGatewayServerMutableState(): GatewayServerMutableState {
     tailscaleCleanup: null,
     postReadySidecars: createGatewaySidecarStopOwner(),
     gatewayLifetimeSidecars: createGatewaySidecarStopOwner(),
-    skillsRefreshTimer: null,
-    skillsRefreshDelayMs: 30_000,
     skillsChangeUnsub: async () => {},
     channelHealthMonitor: null,
     configReloader: {

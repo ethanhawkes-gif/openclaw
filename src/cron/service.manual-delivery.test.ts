@@ -11,6 +11,7 @@ import { createTestGatewayScheduler } from "../test-utils/gateway-scheduler-cloc
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { resolveCronDeliveryPlan } from "./delivery-plan.js";
 import { dispatchCronDelivery } from "./isolated-agent/delivery-dispatch.js";
+import { resolveDeliveryTarget } from "./isolated-agent/delivery-target.js";
 import { CronService } from "./service.js";
 import { createNoopLogger } from "./service.test-harness.js";
 import type { CronEvent } from "./service/state.js";
@@ -19,7 +20,6 @@ const FOUR_HOURS_MS = 4 * 60 * 60_000;
 
 describe("manual cron delivery occurrence", () => {
   it.each([
-    { label: "direct force", mode: "force", queued: false },
     { label: "queued force", mode: "force", queued: true },
     { label: "scheduled due", mode: "due", queued: false },
   ] as const)(
@@ -64,13 +64,19 @@ describe("manual cron delivery occurrence", () => {
                 finished.resolve(event);
               }
             },
-            runIsolatedAgentJob: async ({ job, abortSignal }) => {
+            runIsolatedAgentJob: async ({ job, abortSignal, deliveryAttemptFence }) => {
               const text = "Fresh result from this invocation.";
               const sessionKey = `agent:main:cron:${job.id}`;
+              const deliveryPlan = resolveCronDeliveryPlan(job);
+              const resolvedDelivery = await resolveDeliveryTarget(cfg, "main", {
+                ...job,
+                ...deliveryPlan,
+              });
               const delivery = await dispatchCronDelivery({
                 cfgWithAgentDefaults: cfg,
                 deps: {},
                 job,
+                deliveryAttemptFence,
                 agentId: "main",
                 agentSessionKey: sessionKey,
                 runSessionKey: sessionKey,
@@ -79,9 +85,9 @@ describe("manual cron delivery occurrence", () => {
                 sessionUpdatedAt: now,
                 runStartedAt: now,
                 timeoutMs: 30_000,
-                resolvedDelivery: { ok: true, channel: "telegram", to: "123", mode: "explicit" },
+                resolvedDelivery,
                 deliveryRequested: true,
-                deliveryPlan: resolveCronDeliveryPlan(job),
+                deliveryPlan,
                 undeliveredRunStatus: "ok",
                 spawnOnlyHandoff: false,
                 sourceDeliveryOutcome: {
@@ -91,7 +97,6 @@ describe("manual cron delivery occurrence", () => {
                   unverifiedMessageToolDelivery: false,
                 },
                 deliveryBestEffort: false,
-                deliveryPayloadHasStructuredContent: false,
                 deliveryPayloads: [{ text }],
                 synthesizedText: text,
                 summary: text,

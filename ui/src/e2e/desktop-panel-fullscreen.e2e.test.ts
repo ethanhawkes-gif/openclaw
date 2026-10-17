@@ -80,8 +80,6 @@ async function setTheme(page: Page, theme: "dark" | "light") {
   await page.evaluate((nextTheme) => {
     document.documentElement.dataset.themeMode = nextTheme;
     document.documentElement.dataset.themeResolved = nextTheme;
-    document.documentElement.classList.toggle("wa-light", nextTheme === "light");
-    document.documentElement.classList.toggle("wa-dark", nextTheme === "dark");
     document.documentElement.style.colorScheme = nextTheme;
   }, theme);
 }
@@ -311,7 +309,7 @@ suite.define(() => {
         Object.defineProperty(document, "fullscreenEnabled", { configurable: true, value: false });
       });
       await panel.evaluate((element) =>
-        (element as HTMLElement & { requestUpdate(): void }).requestUpdate(),
+        (element as HTMLElement & { invalidate(): void }).invalidate(),
       );
       await expect
         .poll(() => button.getAttribute("aria-label"))

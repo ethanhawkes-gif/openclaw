@@ -20,6 +20,7 @@ import { createPluginInventoryModuleRefsPlugin } from "./plugin-inventory-module
 import { preparePackageRuntimeAssets } from "./plugin-npm-runtime-assets.mts";
 import { collectPluginThemeAssetPaths } from "./plugin-theme-assets.mts";
 import { isRecord } from "./record-shared.mjs";
+import { createStateSchemaInlinePlugin } from "./state-schema-inline-plugin.mts";
 
 const env = {
   NODE_ENV: "production",
@@ -50,6 +51,61 @@ const BUNDLED_SDK_EXPORTS: Record<string, Record<string, string[]>> = {
 };
 const BUNDLED_SDK_PREFIX = "\0openclaw:bundled-sdk:";
 const HOST_SDK_PREFIX = "\0openclaw:host-sdk:";
+
+function collectNamedSourceExports(source: string) {
+  const names = new Set<string>();
+  const exportClausePattern =
+    /export\s+(?:type\s+)?\{([^}]*)\}\s*(?:from\s+["'][^"']+["'])?\s*;?/gms;
+  for (const match of source.matchAll(exportClausePattern)) {
+    for (const segment of (match[1] ?? "").split(",")) {
+      const name = segment
+        .trim()
+        .replace(/^type\s+/u, "")
+        .match(/(?:^|\s+as\s+)([A-Za-z_$][\w$]*)$/u)?.[1];
+      if (name) {
+        names.add(name);
+      }
+    }
+  }
+  for (const pattern of [
+    /\bexport\s+(?:declare\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/gu,
+    /\bexport\s+(?:declare\s+)?const\s+([A-Za-z_$][\w$]*)/gu,
+    /\bexport\s+type\s+([A-Za-z_$][\w$]*)\s*=/gu,
+    /\bexport\s+interface\s+([A-Za-z_$][\w$]*)/gu,
+    /\bexport\s+class\s+([A-Za-z_$][\w$]*)/gu,
+  ]) {
+    for (const match of source.matchAll(pattern)) {
+      if (match[1]) {
+        names.add(match[1]);
+      }
+    }
+  }
+  return names;
+}
+
+function selectAvailableBundledSdkExports(
+  repoRoot: string,
+  bundledSdkExports: typeof BUNDLED_SDK_EXPORTS,
+) {
+  return Object.fromEntries(
+    Object.entries(bundledSdkExports).flatMap(([specifier, sources]) => {
+      // Trusted current tooling also builds immutable older source roots. Only
+      // inject bindings owned by that root; later files and exports stay host-owned.
+      const availableSources = Object.fromEntries(
+        Object.entries(sources).flatMap(([source, names]) => {
+          const sourcePath = path.join(repoRoot, source);
+          if (!fs.existsSync(sourcePath)) {
+            return [];
+          }
+          const exportedNames = collectNamedSourceExports(fs.readFileSync(sourcePath, "utf8"));
+          const availableNames = names.filter((name) => exportedNames.has(name));
+          return availableNames.length > 0 ? [[source, availableNames]] : [];
+        }),
+      );
+      return Object.keys(availableSources).length > 0 ? [[specifier, availableSources]] : [];
+    }),
+  );
+}
 
 function createBundledSdkExportsPlugin(
   repoRoot: string,
@@ -522,6 +578,28 @@ export function resolvePluginNpmRuntimeBuildPlan(params: PluginNpmRuntimeBuildPa
     ]),
   );
   const setupEntry = normalizePackageEntry(packageJson.openclaw?.setupEntry);
+  // The selected source root owns compatibility bindings, including ones that
+  // are currently absent and may become available in a later checkout.
+  const bundleTelegramLifecycle = packageJson.name === "@openclaw/telegram";
+  const bundledSdkSources = {
+    ...BUNDLED_SDK_EXPORTS,
+    ...(bundleTelegramLifecycle
+      ? {
+          "openclaw/plugin-sdk/channel-outbound": {
+            "src/channels/message/live.ts": ["createLivePreviewLifecycle"],
+          },
+        }
+      : {}),
+  };
+  const bundledSdkImports = {
+    [BUNDLED_GRAPHEME_SDK_IMPORT]: path.join(
+      repoRoot,
+      "packages/normalization-core/src/grapheme.ts",
+    ),
+    ...(params.profile === "qa-gateway-fixture"
+      ? { [QA_PROTOCOL_SDK_IMPORT]: path.join(repoRoot, "src/plugin-sdk/qa-channel-protocol.ts") }
+      : {}),
+  };
 
   const plan = {
     repoRoot,
@@ -535,6 +613,15 @@ export function resolvePluginNpmRuntimeBuildPlan(params: PluginNpmRuntimeBuildPa
     entry,
     outDir: path.join(packageDir, "dist"),
     runtimeFormat,
+    bundleTelegramLifecycle,
+    bundledSdkImports,
+    bundledSdkExports: selectAvailableBundledSdkExports(repoRoot, bundledSdkSources),
+    bundledSdkSourceFiles: [
+      ...Object.values(bundledSdkImports),
+      ...Object.values(bundledSdkSources).flatMap((sources) =>
+        Object.keys(sources).map((source) => path.join(repoRoot, source)),
+      ),
+    ],
     runtimeExtensions: (Array.isArray(packageJson.openclaw?.extensions)
       ? packageJson.openclaw.extensions
       : []
@@ -569,31 +656,8 @@ export async function buildPluginNpmRuntime(params: PluginNpmRuntimeBuildParams)
   // The 9.6 host lacks Telegram's final-observation contract. This canonical factory
   // owns isolated per-turn state; its host error formatter stays external below.
   // Retire this binding when Telegram's declared host floor includes that contract.
-  const bundleTelegramLifecycle = plan.packageJson.name === "@openclaw/telegram";
-  const bundledSdkExports = {
-    ...BUNDLED_SDK_EXPORTS,
-    ...(bundleTelegramLifecycle
-      ? {
-          "openclaw/plugin-sdk/channel-outbound": {
-            "src/channels/message/live.ts": ["createLivePreviewLifecycle"],
-          },
-        }
-      : {}),
-  };
-  const bundledSdkImports = {
-    [BUNDLED_GRAPHEME_SDK_IMPORT]: path.join(
-      plan.repoRoot,
-      "packages/normalization-core/src/grapheme.ts",
-    ),
-    ...(plan.profile === "qa-gateway-fixture"
-      ? {
-          [QA_PROTOCOL_SDK_IMPORT]: path.join(
-            plan.repoRoot,
-            "src/plugin-sdk/qa-channel-protocol.ts",
-          ),
-        }
-      : {}),
-  };
+  const { bundleTelegramLifecycle, bundledSdkExports, bundledSdkImports } = plan;
+  const inputFiles = new Set<string>();
   const bundledSdkSpecifiers = new Set([
     ...Object.keys(bundledSdkImports),
     ...Object.keys(bundledSdkExports),
@@ -612,8 +676,17 @@ export async function buildPluginNpmRuntime(params: PluginNpmRuntimeBuildParams)
     },
     entry: plan.entry,
     plugins: [
+      {
+        name: "openclaw:runtime-build-inputs",
+        moduleParsed({ id }) {
+          if (path.isAbsolute(id) && !id.split(path.sep).includes("node_modules")) {
+            inputFiles.add(path.relative(plan.repoRoot, id).split(path.sep).join("/"));
+          }
+        },
+      },
       createBundledSdkExportsPlugin(plan.repoRoot, bundledSdkExports, bundleTelegramLifecycle),
       createPluginInventoryModuleRefsPlugin(plan.packageDir),
+      createStateSchemaInlinePlugin(plan.repoRoot),
     ],
     outputOptions: {
       // Published plugins still support hosts predating these private source facades.
@@ -643,7 +716,8 @@ export async function buildPluginNpmRuntime(params: PluginNpmRuntimeBuildParams)
   rewriteCommonJsRuntimeSpecifiers(plan);
   return {
     ...plan,
-    ...preparePackageRuntimeAssets(plan),
+    inputFiles: [...inputFiles].toSorted(),
+    ...(await preparePackageRuntimeAssets(plan)),
   };
 }
 
@@ -747,7 +821,7 @@ type PluginNpmRuntimeBuildArgs =
       profile?: "qa-gateway-fixture";
     };
 
-function readPackageDirArg(argv: string[]): PluginNpmRuntimeBuildArgs {
+export function parseArgs(argv: string[]): PluginNpmRuntimeBuildArgs {
   const args = argv[0] === "--" ? argv.slice(1) : [...argv];
   const prepareIndex = args.indexOf("--prepare-native-import");
   if (prepareIndex !== -1) {
@@ -774,11 +848,6 @@ function readPackageDirArg(argv: string[]): PluginNpmRuntimeBuildArgs {
   return prepareIndex !== -1
     ? { packageDir, prepareNativeImport: true }
     : { packageDir, ...(fixtureIndex !== -1 ? { profile: "qa-gateway-fixture" as const } : {}) };
-}
-
-/** @internal Directly tested script implementation detail. */
-export function parseArgs(argv: string[]) {
-  return readPackageDirArg(argv);
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {

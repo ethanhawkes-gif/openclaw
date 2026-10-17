@@ -1,12 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { AGENT_RUN_RESTART_ABORT_STOP_REASON } from "../../agents/run-termination.js";
+import { ErrorCodes, errorShape } from "../../../packages/gateway-protocol/src/index.js";
 import { resolveAgentTimeoutMs } from "../../agents/timeout.js";
-import { getAgentEventLifecycleGeneration } from "../../infra/agent-events.js";
 import {
   isSubagentCoordinationInputProvenance,
   type InputProvenance,
 } from "../../sessions/input-provenance.js";
 import { resolveAgentRunExpiresAtMs } from "../chat-abort.js";
+import { logAttachmentFailure } from "../chat-attachments.js";
 import type { AgentRunRequest } from "../server-methods/agent-request-types.js";
 import type { CommittedResetCompletion } from "../server-methods/agent-reset-phase.js";
 import {
@@ -14,14 +14,12 @@ import {
   buildBareSessionResetResult,
   sessionResetAckText,
 } from "../server-methods/agent-session-reset.js";
-import { emitSessionsChanged } from "../server-methods/session-change-event.js";
 import {
-  buildAbortedAgentPayload,
+  AgentRequestReservationEndedError,
   isAcceptedAgentDedupePayload,
   isPreRegistrationAbortedAgentDedupeEntryForSession,
   readGatewayDedupeEntry,
   replayAgentTurnIfCached,
-  setAbortedAgentDedupeEntries,
   setGatewayDedupeEntries,
 } from "./agent-dedupe.js";
 import type { AgentTurnContext, AgentTurnFrame, AgentTurnIo } from "./types.js";
@@ -32,7 +30,6 @@ export function createAgentDedupeLifecycle(params: {
   cfg: ReturnType<AgentTurnContext["getRuntimeConfig"]>;
   request: AgentRunRequest;
   runId: string;
-  lifecycleGeneration: string;
   agentDedupeKeys: string[];
   suppressVisibleSessionEffects: boolean;
   inputProvenance?: InputProvenance;
@@ -69,8 +66,7 @@ export function createAgentDedupeLifecycle(params: {
     const acceptedAt = Date.now();
     const pendingTimeoutMs = resolveAgentTimeoutMs({
       cfg: params.cfg,
-      overrideSeconds:
-        typeof params.request.timeout === "number" ? params.request.timeout : undefined,
+      overrideSeconds: params.request.timeout,
     });
     setGatewayDedupeEntries({
       dedupe: params.context.dedupe,
@@ -118,7 +114,7 @@ export function createAgentDedupeLifecycle(params: {
 
   const assertReservationCurrent = () => {
     if (!ownsReservation()) {
-      throw new Error("Agent request reservation is no longer active.");
+      throw new AgentRequestReservationEndedError();
     }
   };
 
@@ -138,37 +134,17 @@ export function createAgentDedupeLifecycle(params: {
       ) {
         return undefined;
       }
+      if (error instanceof AgentRequestReservationEndedError) {
+        logAttachmentFailure(params.context.logGateway, "agent attachment parse failed", error);
+        params.io.emitAcceptance([
+          false,
+          undefined,
+          errorShape(ErrorCodes.INVALID_REQUEST, String(error)),
+        ]);
+        return undefined;
+      }
       throw error;
     };
-
-  const recordCommittedReset = (
-    completion: CommittedResetCompletion,
-    followUpNotice: string,
-    keys = params.agentDedupeKeys,
-  ) => {
-    const response: AgentTurnFrame = completion.replyError
-      ? [false, undefined, completion.replyError]
-      : [
-          true,
-          buildBareSessionResetResponse({
-            runId: params.runId,
-            result: buildBareSessionResetResult({
-              reason: completion.reason,
-              sessionId: completion.sessionId,
-              ackText: completion.followUpPending
-                ? `${sessionResetAckText(completion.reason)} ${followUpNotice}`
-                : undefined,
-            }),
-          }),
-          undefined,
-        ];
-    setGatewayDedupeEntries({
-      dedupe: params.context.dedupe,
-      keys,
-      entry: { ts: Date.now(), ok: response[0], payload: response[1], error: response[2] },
-    });
-    return response;
-  };
 
   const clearUnaccepted = () => {
     const keys = ownedReservationKeys();
@@ -178,11 +154,28 @@ export function createAgentDedupeLifecycle(params: {
     if (committedResetCompletion) {
       // Cleanup may follow any failed follow-up admission, not only reset-phase
       // errors. Reconcile the reset fact without delivering or starting new work.
-      recordCommittedReset(
-        committedResetCompletion,
-        "Request ended before the follow-up ran; send the follow-up message again.",
+      const completion = committedResetCompletion;
+      const response: AgentTurnFrame = completion.replyError
+        ? [false, undefined, completion.replyError]
+        : [
+            true,
+            buildBareSessionResetResponse({
+              runId: params.runId,
+              result: buildBareSessionResetResult({
+                reason: completion.reason,
+                sessionId: completion.sessionId,
+                ackText: completion.followUpPending
+                  ? `${sessionResetAckText(completion.reason)} Request ended before the follow-up ran; send the follow-up message again.`
+                  : undefined,
+              }),
+            }),
+            undefined,
+          ];
+      setGatewayDedupeEntries({
+        dedupe: params.context.dedupe,
         keys,
-      );
+        entry: { ts: Date.now(), ok: response[0], payload: response[1], error: response[2] },
+      });
       accepted = true;
       return;
     }
@@ -230,65 +223,6 @@ export function createAgentDedupeLifecycle(params: {
     });
   };
 
-  const abortForLifecycleRotation = (target?: { sessionKey?: string; agentId?: string }) => {
-    if (params.lifecycleGeneration === getAgentEventLifecycleGeneration()) {
-      return false;
-    }
-    // Stop and replacement own their outcome even when the old caller observes
-    // restart later. Replay that owner instead of publishing an obsolete reset.
-    if (!ownsReservation()) {
-      clearUnaccepted();
-      if (
-        !replayAgentTurnIfCached({
-          preflight: params,
-          context: params.context,
-          io: params.io,
-        })
-      ) {
-        params.io.emitAcceptance([
-          true,
-          buildAbortedAgentPayload(params.runId, AGENT_RUN_RESTART_ABORT_STOP_REASON),
-          undefined,
-        ]);
-      }
-      accepted = true;
-      return true;
-    }
-    if (committedResetCompletion) {
-      const completion = committedResetCompletion;
-      accepted = true;
-      const response = recordCommittedReset(
-        completion,
-        "Gateway restarted before the follow-up ran; send the follow-up message again.",
-      );
-      params.io.emitAcceptance(response, { runId: params.runId });
-      emitSessionsChanged(params.context, {
-        sessionKey: completion.sessionKey,
-        ...(completion.agentId ? { agentId: completion.agentId } : {}),
-        reason: completion.reason,
-      });
-      return true;
-    }
-    accepted = true;
-    setAbortedAgentDedupeEntries({
-      dedupe: params.context.dedupe,
-      keys: params.agentDedupeKeys,
-      agentId: target?.agentId,
-      sessionKey: target?.sessionKey,
-      runId: params.runId,
-      stopReason: AGENT_RUN_RESTART_ABORT_STOP_REASON,
-    });
-    params.io.emitAcceptance(
-      [
-        true,
-        buildAbortedAgentPayload(params.runId, AGENT_RUN_RESTART_ABORT_STOP_REASON),
-        undefined,
-      ],
-      { runId: params.runId },
-    );
-    return true;
-  };
-
   return {
     reservationId,
     ownsReservation,
@@ -298,9 +232,7 @@ export function createAgentDedupeLifecycle(params: {
     reserve,
     bindSessionTarget,
     clearUnaccepted,
-    abortForLifecycleRotation,
     isReserved: () => reserved,
-    isAccepted: () => accepted,
     markAccepted: (value: boolean) => {
       accepted = value;
     },
