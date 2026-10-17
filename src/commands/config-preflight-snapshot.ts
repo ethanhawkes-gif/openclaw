@@ -1,4 +1,5 @@
 import { listAgentIds } from "../agents/agent-scope-config.js";
+import { cloneEnvWithPlatformSemantics } from "../config/config-env-vars.js";
 import { createConfigIO } from "../config/io.factory.js";
 import { createConfigReadError, isConfigReadFailure } from "../config/io.invalid-config.js";
 import {
@@ -8,14 +9,26 @@ import {
   type ConfigSnapshotReadOptions,
 } from "../config/io.js";
 import type { PreparedConfigRecovery } from "../config/io.types.js";
-import { describeConfigSnapshotInputChange } from "../config/snapshot-inputs.js";
 import type { ConfigFileSnapshot } from "../config/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { resolveDatabaseEngineSelection } from "../infra/database-engine/config.js";
+import {
+  getDatabaseEngineSelection,
+  installDatabaseEngineSelection,
+  type DatabaseEngineSelection,
+} from "../infra/database-engine/context.js";
 import type { DeferredPluginMigration } from "../infra/deferred-plugin-migrations.js";
 import { withDeferredPluginDoctorMigrations } from "../plugins/doctor-contract-registry.js";
-import { createPluginCache, getPluginCache, withPluginCache } from "../plugins/plugin-cache.js";
+import {
+  createPluginCache,
+  getPluginCache,
+  getPluginMetadataSnapshotCache,
+  withPluginCache,
+  type PluginCache,
+} from "../plugins/plugin-cache.js";
 import { completePluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.js";
 import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.types.js";
+import { normalizeAgentId } from "../routing/session-key.js";
 import { readAgentDatabaseAdmissionRefusal } from "../state/agent-database-admission.js";
 import {
   withArtifactPreservingStateReads,
@@ -26,11 +39,11 @@ import {
   refuseStartupMigrationsForLiveGatewayOwner,
   rethrowStartupConfigFailure,
   throwStartupMigrationGuardRejected,
-  throwStartupMigrationIdentityChanged,
 } from "./doctor-startup-migration-refusal.js";
 import { addDoctorLegacyIssues } from "./doctor/shared/legacy-config-issues.js";
 
 export type ConfigPreflightSnapshotRead = {
+  databaseEngineSelection?: DatabaseEngineSelection;
   snapshot: ConfigFileSnapshot;
   pluginMetadataSnapshot?: PluginMetadataSnapshot;
 };
@@ -38,24 +51,58 @@ export type ConfigPreflightSnapshotRead = {
 // Match the five-minute startup migration lease budget, including slow cold starts.
 const STARTUP_STATE_ADMISSION_TIMEOUT_MS = 5 * 60_000;
 
-export async function readConfigPreflightSnapshot(params: {
-  purpose: "startup" | "doctor";
-  allowCurrentPluginMetadata: boolean;
-  includePluginMetadata: boolean;
-  isolateEnv?: boolean;
-  measure?: ConfigSnapshotReadMeasure;
-  observe?: boolean;
-  skipPluginValidation: boolean;
-  /** Complete a private update snapshot before Doctor contract modules are inspected. */
-  prepareSnapshot?: (snapshot: ConfigFileSnapshot) => Promise<void>;
-  preparePluginMigrations?: (
-    snapshot: ConfigFileSnapshot,
-  ) => Promise<readonly DeferredPluginMigration[]>;
-  deferredPluginMigrations?: readonly DeferredPluginMigration[];
-}): Promise<ConfigPreflightSnapshotRead> {
+/** Own executable inspection caches until a final snapshot transfers to its caller. */
+export function createConfigPreflightSnapshotReader() {
+  const caches = new Set<PluginCache>();
+  return {
+    async [Symbol.asyncDispose]() {
+      await Promise.all([...caches].map((cache) => cache[Symbol.asyncDispose]()));
+      caches.clear();
+    },
+    read(params: Parameters<typeof readConfigPreflightSnapshot>[0]) {
+      const cache = params.allowCurrentPluginMetadata ? getPluginCache() : createPluginCache();
+      if (!params.allowCurrentPluginMetadata) {
+        caches.add(cache);
+      }
+      return readConfigPreflightSnapshot(params, cache);
+    },
+    async takePluginCache(
+      snapshot: PluginMetadataSnapshot | undefined,
+    ): Promise<PluginCache | undefined> {
+      const selected = snapshot && getPluginMetadataSnapshotCache(snapshot);
+      await Promise.all(
+        [...caches]
+          .filter((cache) => cache !== selected)
+          .map(async (cache) => {
+            await cache[Symbol.asyncDispose]();
+            caches.delete(cache);
+          }),
+      );
+      return selected && caches.delete(selected) ? selected : undefined;
+    },
+  };
+}
+
+async function readConfigPreflightSnapshot(
+  params: {
+    purpose: "startup" | "doctor";
+    allowCurrentPluginMetadata: boolean;
+    includePluginMetadata: boolean;
+    isolateEnv?: boolean;
+    measure?: ConfigSnapshotReadMeasure;
+    observe?: boolean;
+    skipPluginValidation: boolean;
+    /** Complete a private update snapshot before Doctor contract modules are inspected. */
+    prepareSnapshot?: (snapshot: ConfigFileSnapshot) => Promise<void>;
+    preparePluginMigrations?: (
+      snapshot: ConfigFileSnapshot,
+    ) => Promise<readonly DeferredPluginMigration[]>;
+    deferredPluginMigrations?: readonly DeferredPluginMigration[];
+  },
+  cache: PluginCache,
+): Promise<ConfigPreflightSnapshotRead> {
   // Explicit management rereads cross a lease or mutation boundary. A resolver's
   // allowCurrent:false still reuses facts within an existing operation generation.
-  const cache = params.allowCurrentPluginMetadata ? getPluginCache() : createPluginCache();
   return withPluginCache(cache, async () => {
     const sharedOptions = {
       ...(params.isolateEnv ? { isolateEnv: true } : {}),
@@ -143,10 +190,22 @@ export async function readAdmittedConfigSnapshot(params: {
       }
       // Read-only preparation shares one state generation. Release its snapshot before
       // the caller's live guard or any recovery application / writer lease acquisition.
+      const selection =
+        getDatabaseEngineSelection() ??
+        (await resolveDatabaseEngineSelection(selected.config, params.env));
+      installDatabaseEngineSelection(selection);
+      const withStateSnapshot: typeof withOpenClawStateDatabaseReadSnapshot =
+        selection.effectiveEngines.state === "postgres"
+          ? (operation) => operation()
+          : withOpenClawStateDatabaseReadSnapshot;
       const admitted = await measureDoctorConfigPreflightStep("admission.state-snapshot", () =>
-        withOpenClawStateDatabaseReadSnapshot(
+        withStateSnapshot(
           async () => {
-            const recoveryOptions = { configPath: selected.path, observe: false, env: params.env };
+            const recoveryOptions = {
+              configPath: selected.path,
+              observe: false,
+              env: params.env,
+            };
             const coreRecovery = await measureDoctorConfigPreflightStep(
               "admission.core-recovery",
               () =>
@@ -156,27 +215,37 @@ export async function readAdmittedConfigSnapshot(params: {
                 }).prepareConfigRecovery(selected),
             );
             const candidate = coreRecovery?.snapshot ?? selected;
-            await assertStartupStateReady({
-              cfg: candidate.sourceConfig ?? candidate.config,
-              env: params.env,
-            });
-            if (candidate.valid) {
-              await params.validateConfig?.(candidate);
+            // Both readers use the admitted snapshot. Pin schema selection before the
+            // full config read applies env defaults, and join both before releasing it.
+            const [readiness, configRead] = await Promise.allSettled([
+              (async () => {
+                await assertStartupStateReady({
+                  cfg: candidate.sourceConfig ?? candidate.config,
+                  env: cloneEnvWithPlatformSemantics(params.env),
+                });
+                if (candidate.valid) {
+                  await params.validateConfig?.(candidate);
+                }
+              })(),
+              measureDoctorConfigPreflightStep("admission.plugin-config", () =>
+                params.readSnapshot(coreRecovery ? { isolateEnv: true } : undefined),
+              ),
+            ]);
+            if (readiness.status === "rejected") {
+              throw readiness.reason;
             }
-            // A discarded config cannot publish env values before its backup is restored.
-            let read = await measureDoctorConfigPreflightStep("admission.plugin-config", () =>
-              params.readSnapshot(coreRecovery ? { isolateEnv: true } : undefined),
-            );
-            assertPreflightConfigUnchanged(selected, read.snapshot);
+            if (configRead.status === "rejected") {
+              throw configRead.reason;
+            }
+            let read = configRead.value;
+            if (isConfigReadFailure(read.snapshot)) {
+              throw createConfigReadError(read.snapshot);
+            }
             const recovery = await measureDoctorConfigPreflightStep(
               "admission.config-recovery",
               () => createConfigIO(recoveryOptions).prepareConfigRecovery(read.snapshot),
             );
-            if (Boolean(coreRecovery) !== Boolean(recovery)) {
-              throwStartupMigrationIdentityChanged();
-            }
             if (recovery) {
-              assertPreflightConfigUnchanged(candidate, recovery.snapshot);
               read = {
                 snapshot: recovery.snapshot,
                 pluginMetadataSnapshot: recovery.pluginMetadataSnapshot,
@@ -185,13 +254,18 @@ export async function readAdmittedConfigSnapshot(params: {
             if (read.snapshot.valid) {
               await params.validateConfig?.(read.snapshot);
               await measureDoctorConfigPreflightStep("admission.device-identity", async () => {
-                const { loadDeviceIdentityIfPresent } = await import("../infra/device-identity.js");
-                loadDeviceIdentityIfPresent({ env: params.env });
+                const { loadDeviceIdentityIfPresentAsync } =
+                  await import("../infra/device-identity-async.js");
+                await loadDeviceIdentityIfPresentAsync({ env: params.env });
               });
             }
             return { ...read, ...(recovery ? { recovery } : {}) };
           },
-          { env: params.env, admissionTimeoutMs: STARTUP_STATE_ADMISSION_TIMEOUT_MS },
+          {
+            env: params.env,
+            admissionTimeoutMs: STARTUP_STATE_ADMISSION_TIMEOUT_MS,
+            reuseCleanClose: true,
+          },
         ),
       );
       if (
@@ -202,26 +276,14 @@ export async function readAdmittedConfigSnapshot(params: {
       ) {
         throwStartupMigrationGuardRejected();
       }
-      return admitted;
+      return {
+        ...admitted,
+        databaseEngineSelection: selection,
+      };
     } catch (error) {
       return rethrowStartupConfigFailure(error);
     }
   });
-}
-
-export function assertPreflightConfigUnchanged(
-  before: ConfigFileSnapshot,
-  after: ConfigFileSnapshot,
-): void {
-  // Unavailable bytes cannot prove input drift or authorize a terminal refusal.
-  const unreadable = [before, after].find(isConfigReadFailure);
-  if (unreadable) {
-    throw createConfigReadError(unreadable);
-  }
-  const change = describeConfigSnapshotInputChange(before, after);
-  if (change) {
-    throwStartupMigrationIdentityChanged(change);
-  }
 }
 
 /** Admission runs before lease acquisition: even acquiring a lease commits SQLite writes. */
@@ -235,6 +297,7 @@ async function assertStartupStateReady(params: {
   );
   const agentCount = listAgentIds(params.cfg).length;
   const admissionMetrics: Record<string, number> = { agentCount };
+  let registeredDatabases: readonly { agentId: string; path: string }[] = [];
   await measureDoctorConfigPreflightStep(
     "admission.database-readiness",
     () =>
@@ -245,6 +308,12 @@ async function assertStartupStateReady(params: {
         onAgentInspection: (stats) => {
           Object.assign(admissionMetrics, stats);
         },
+        onRegisteredAgentDatabases: (targets) => {
+          registeredDatabases = targets.map((target) => ({
+            ...target,
+            agentId: normalizeAgentId(target.agentId),
+          }));
+        },
       }),
     undefined,
     () => admissionMetrics,
@@ -252,21 +321,11 @@ async function assertStartupStateReady(params: {
   const [
     { assertSessionStoreMigrationComplete },
     { resolveAllAgentSessionStoreCandidateTargetsSync },
-    { inspectOpenClawRegisteredAgentDatabases },
   ] = await measureDoctorConfigPreflightStep("admission.session-runtime-import", () =>
     Promise.all([
       import("../config/sessions/startup-migration.js"),
       import("../config/sessions/targets.js"),
-      import("../state/openclaw-agent-db-registry.js"),
     ]),
-  );
-  const registeredDatabases = await measureDoctorConfigPreflightStep(
-    "admission.agent-inventory",
-    () =>
-      inspectOpenClawRegisteredAgentDatabases({
-        env: params.env,
-        includeIncompatibleSchemaVersions: true,
-      }),
   );
   const targets = await measureDoctorConfigPreflightStep(
     "admission.session-targets",

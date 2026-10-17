@@ -1,10 +1,15 @@
 import type { StatementSync as NativeStatement } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
+import { setRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
 import { upsertSessionEntryCore } from "../config/sessions/session-accessor.js";
+import { retainPreparedSessionSharingFacts } from "../config/sessions/session-accessor.sqlite-entry-cache-publication-state.js";
+import { retainSessionEntryWorkerPublication } from "../config/sessions/session-accessor.sqlite-entry-worker-publication.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { requireNodeSqlite } from "../infra/node-sqlite.js";
 import type { BoundWebPushSubscription } from "../infra/push-web.js";
+import { readImageMetadataFromHeader } from "../media/image-ops.js";
+import { encodePngRgba } from "../media/png-encode.js";
 import { closeOpenClawAgentDatabasesAsync } from "../state/openclaw-agent-db-lifecycle.js";
 import { closeOpenClawStateDatabaseAsync } from "../state/openclaw-state-db-cache.js";
 import { setUserProfileRole } from "../state/user-profile-writes.worker.js";
@@ -56,13 +61,6 @@ vi.mock("../logging/subsystem.js", async (importOriginal) => {
       return subsystem === "gateway/web-push" ? { ...logger, warn: webPushWarnMock } : logger;
     },
   };
-});
-
-vi.mock("../infra/device-pairing.js", async () => {
-  const actual = await vi.importActual<typeof import("../infra/device-pairing.js")>(
-    "../infra/device-pairing.js",
-  );
-  return actual;
 });
 
 vi.mock("../infra/device-pairing-worker.js", async (importOriginal) => ({
@@ -206,6 +204,7 @@ describe("event Web Push classification", () => {
       release: () => {},
     });
     prepareSessionMutationFactsMock.mockResolvedValue({
+      prepareRead: () => undefined,
       readCurrent: () => ({ target: null, membership: new Set<string>() }),
       release: () => {},
     });
@@ -222,6 +221,59 @@ describe("event Web Push classification", () => {
 
   afterEach(() => vi.restoreAllMocks());
 
+  it("includes the selected avatar only for identified agent notifications", async () => {
+    const identified = boundSubscription("identified");
+    const privateTarget = boundSubscription("private");
+    privateTarget.devicePreferences.detailLevel = "private";
+    listBoundWebPushSubscriptionsMock.mockResolvedValue([identified, privateTarget]);
+    listDevicePairingMock.mockReturnValue({
+      paired: [pairedOperator("identified"), pairedOperator("private")],
+    });
+    const pixels = Buffer.alloc(64 * 64 * 4, Buffer.from([255, 150, 0, 255]));
+    const avatar = `data:image/png;base64,${encodePngRgba(pixels, 64, 64).toString("base64")}`;
+    const cfg: OpenClawConfig = { agents: { entries: { research: { identity: { avatar } } } } };
+
+    createEventWebPushDelivery({ getRuntimeConfig: () => cfg }).handleEvent(
+      "chat",
+      { state: "final", runId: "avatar-run" },
+      { agentId: "research", sessionKeys: ["agent:research:thread.1"] },
+    );
+
+    await vi.waitFor(() => expect(preparedWebPushSendMock).toHaveBeenCalledTimes(2), {
+      timeout: 3_000,
+    });
+    const identifiedPayload = preparedWebPushSendMock.mock.calls.find(
+      ([call]) => call.subscriptions[0] === identified,
+    )?.[0].payload;
+    const privatePayload = preparedWebPushSendMock.mock.calls.find(
+      ([call]) => call.subscriptions[0] === privateTarget,
+    )?.[0].payload;
+    expect(identifiedPayload.icon).toMatch(/^data:image\/png;base64,/);
+    expect(identifiedPayload.icon.length).toBeLessThanOrEqual(2_400);
+    expect(
+      readImageMetadataFromHeader(Buffer.from(identifiedPayload.icon.split(",")[1], "base64")),
+    ).toEqual({ width: 32, height: 32 });
+    expect(privatePayload).not.toHaveProperty("icon");
+  });
+
+  it("drops a prepared avatar when identity changes during recipient preparation", async () => {
+    const avatar = `data:image/png;base64,${encodePngRgba(Buffer.from([255, 150, 0, 255]), 1, 1).toString("base64")}`;
+    const identity = { avatar };
+    const cfg: OpenClawConfig = { agents: { entries: { research: { identity } } } };
+    prepareDevicePairingMock.mockImplementationOnce(async () => {
+      identity.avatar = "🌱";
+    });
+
+    createEventWebPushDelivery({ getRuntimeConfig: () => cfg }).handleEvent(
+      "chat",
+      { state: "final", runId: "changed-avatar-run" },
+      { agentId: "research", sessionKeys: ["agent:research:thread.1"] },
+    );
+
+    await vi.waitFor(() => expect(preparedWebPushSendMock).toHaveBeenCalledOnce());
+    expect(preparedWebPushSendMock.mock.calls[0]?.[0].payload).not.toHaveProperty("icon");
+  });
+
   it("waits for final completion after a parent yields to its children", async () => {
     const delivery = createEventWebPushDelivery({ getRuntimeConfig: () => ({}) });
     delivery.handleEvent("chat", { state: "delta", runId: "run-1" });
@@ -237,6 +289,69 @@ describe("event Web Push classification", () => {
       }),
     );
   });
+
+  it.each([false, true])(
+    "waits for session publication and fails closed on unknown settlement=%s",
+    async (unknown) => {
+      const sessionKey = "agent:main:publication";
+      const databaseIdentity = "synthetic-web-push-publication";
+      const retained = retainPreparedSessionSharingFacts({
+        databaseIdentity: `file:${databaseIdentity}`,
+        sessionKey,
+        entry: { sessionId: "publication-session", updatedAt: 1 },
+        membership: new Set<string>(),
+      });
+      const publication = retainSessionEntryWorkerPublication({
+        agentId: "main",
+        storePath: "/synthetic/web-push/sessions",
+        databaseIdentity,
+      });
+      const pairingEntered = createDeferred();
+      const publicationJoined = createDeferred();
+      prepareSessionMutationFactsMock.mockResolvedValue({
+        prepareRead: () => {
+          const pending = retained.prepareRead();
+          publicationJoined.resolve();
+          return pending;
+        },
+        readCurrent: () => {
+          const current = retained.readCurrent();
+          if (!current) {
+            throw new Error("session publication unavailable");
+          }
+          return { target: null, membership: current.membership };
+        },
+        release: retained.release,
+      });
+      prepareDevicePairingMock.mockImplementationOnce(async () => {
+        publication.begin([sessionKey], []);
+        pairingEntered.resolve();
+      });
+      createEventWebPushDelivery({ getRuntimeConfig: () => ({}) }).handleEvent(
+        "chat",
+        { state: "final", runId: "publication-run" },
+        { sessionKeys: [sessionKey] },
+      );
+      try {
+        await pairingEntered.promise;
+        await Promise.race([publicationJoined.promise, authorityCompleted.promise]);
+        expect(webPushWarnMock).not.toHaveBeenCalled();
+        expect(preparedWebPushSendMock).not.toHaveBeenCalled();
+        publication.settle(undefined, unknown);
+        await authorityCompleted.promise;
+        if (unknown) {
+          await vi.waitFor(() => expect(webPushWarnMock).toHaveBeenCalled());
+          expect(preparedWebPushSendMock).not.toHaveBeenCalled();
+        } else {
+          expect(preparedWebPushSendMock).toHaveBeenCalledOnce();
+          expect(webPushWarnMock).not.toHaveBeenCalled();
+        }
+      } finally {
+        publication.settle(undefined, false);
+        retained.release();
+      }
+    },
+  );
 
   it.each([
     {
@@ -603,17 +718,30 @@ describe("event Web Push classification", () => {
       expect(preparedWebPushSendMock).toHaveBeenCalledTimes(2);
     });
 
-    it("omits sensitive details from an unexpected preparation error", async () => {
-      const failure = new Error("https://push.example.test/private-endpoint?secret=do-not-log");
+    it("records the raw cause and stage of an agent-finished preparation failure", async () => {
+      const failure = new TypeError("synthetic invalid VAPID key", {
+        cause: new Error("invalid key length"),
+      });
       prepareWebPushNotificationSenderMock.mockRejectedValueOnce(failure);
       createEventWebPushDelivery({
         getRuntimeConfig: () => ({}),
         log: { warn: webPushWarnMock },
-      }).deliverMention(humanMention());
+      }).handleEvent("chat", { state: "final", runId: "failure-run" });
 
       await vi.waitFor(() => expect(webPushWarnMock).toHaveBeenCalledOnce());
       expect(webPushWarnMock.mock.calls).toEqual([
-        ["event Web Push delivery could not complete", { category: "human-mentioned" }],
+        [
+          "event Web Push delivery could not complete",
+          {
+            category: "agent-finished",
+            stage: "sender",
+            error: "synthetic invalid VAPID key | invalid key length",
+            errorName: "TypeError",
+            errorCode: undefined,
+            stack: failure.stack,
+            retry: false,
+          },
+        ],
       ]);
     });
 
@@ -661,6 +789,7 @@ describe("event Web Push classification", () => {
               },
             },
           };
+          setRuntimeConfigSnapshot(cfg);
           const sessionKey = "agent:main:foreign-draft";
           await upsertSessionEntryCore(
             { agentId: "main", sessionKey },

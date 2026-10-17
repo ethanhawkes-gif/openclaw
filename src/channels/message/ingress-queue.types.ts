@@ -130,6 +130,16 @@ type ChannelIngressQueueEnqueueResult<TPayload, TMetadata, TCompletedMetadata> =
     };
 
 export type ChannelIngressQueue<TPayload, TMetadata = unknown, TCompletedMetadata = unknown> = {
+  /** One durable admission for a transport batch; optional for external queue implementations. */
+  enqueueBatch?(
+    events: ReadonlyArray<{
+      id: string;
+      payload: TPayload;
+      metadata?: TMetadata;
+      receivedAt?: number;
+      laneKey?: string;
+    }>,
+  ): Promise<Array<ChannelIngressQueueEnqueueResult<TPayload, TMetadata, TCompletedMetadata>>>;
   enqueue(
     id: string,
     payload: TPayload,
@@ -139,6 +149,17 @@ export type ChannelIngressQueue<TPayload, TMetadata = unknown, TCompletedMetadat
       laneKey?: string;
     },
   ): Promise<ChannelIngressQueueEnqueueResult<TPayload, TMetadata, TCompletedMetadata>>;
+  /** Current-authority enqueue; absence is unsupported, never fall back to unguarded intake. */
+  enqueueAuthorized?: (
+    id: string,
+    payload: TPayload,
+    options: {
+      metadata?: TMetadata;
+      receivedAt?: number;
+      laneKey?: string;
+      assertCurrent: () => void;
+    },
+  ) => Promise<ChannelIngressQueueEnqueueResult<TPayload, TMetadata, TCompletedMetadata>>;
   listPending(options?: {
     limit?: number | "all";
     orderBy?: "received" | "id";
@@ -170,7 +191,7 @@ export type ChannelIngressQueue<TPayload, TMetadata = unknown, TCompletedMetadat
   }): Promise<ChannelIngressQueueClaim<TPayload, TMetadata> | null>;
   claim(
     id: string,
-    options?: { ownerId?: string },
+    options?: { ownerId?: string; laneKey?: string },
   ): Promise<ChannelIngressQueueClaim<TPayload, TMetadata> | null>;
   refreshClaim?(
     claim: ChannelIngressQueueClaimRef,

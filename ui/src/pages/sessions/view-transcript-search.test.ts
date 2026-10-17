@@ -1,9 +1,15 @@
 /* @vitest-environment jsdom */
 
-import { render } from "lit";
-import { describe, expect, it, vi } from "vitest";
-import { buildMultiResult, buildProps } from "./view.test-support.ts";
-import { renderSessions } from "./view.ts";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createOverlay, type Overlay } from "../../components/overlay-lifecycle.ts";
+import {
+  disposeSessionViews,
+  renderSessionsView,
+  buildMultiResult,
+  buildProps,
+} from "./view.test-support.tsx";
+
+afterEach(disposeSessionViews);
 
 describe("sessions transcript search view", () => {
   it.each([true, false])(
@@ -12,50 +18,79 @@ describe("sessions transcript search view", () => {
       const container = document.createElement("div");
       const onTranscriptSearchChange = vi.fn();
       const onTranscriptSearch = vi.fn();
-      render(
-        renderSessions({
+      renderSessionsView(
+        {
           ...buildProps(buildMultiResult([])),
           searchQuery: "agent label",
           transcriptSearchAvailable: available,
           transcriptSearchQuery: available ? "  exact phrase  " : "hidden",
           onTranscriptSearchChange,
           onTranscriptSearch,
-        }),
+        },
         container,
       );
       await Promise.resolve();
 
       const rosterFilter = container.querySelector<HTMLInputElement>(
-        '.sessions-filter-bar input[type="text"]',
+        '.sessions-filter-popover__search input[type="text"]',
       );
-      const transcriptInput = container.querySelector<HTMLInputElement>(
-        '.sessions-transcript-search input[type="search"]',
+      const transcriptTrigger = container.querySelector<HTMLButtonElement>(
+        ".sessions-transcript-search__trigger",
       );
       expect(rosterFilter?.value).toBe("agent label");
       expect(rosterFilter?.getAttribute("aria-label")).toBe("Filter by key, agent, label, kind…");
-      expect(transcriptInput?.value).toBe(available ? "  exact phrase  " : "hidden");
-      expect(transcriptInput?.disabled).toBe(!available);
+      expect(transcriptTrigger?.getAttribute("aria-label")).toBe(
+        available ? "Search transcripts" : "Connect to the Gateway to search transcripts.",
+      );
+      expect(transcriptTrigger?.disabled).toBe(!available);
+      expect(container.querySelector(".sessions-transcript-search__input input")).toBeNull();
+      expect(container.querySelector('.settings-section__desc [role="status"]')?.textContent).toBe(
+        available ? undefined : "Connect to the Gateway to search transcripts.",
+      );
       if (available) {
+        transcriptTrigger!.click();
+        await Promise.resolve();
+        const transcriptInput = container.querySelector<HTMLInputElement>(
+          '.sessions-transcript-search__input input[type="search"]',
+        );
+        expect(transcriptInput?.value).toBe("  exact phrase  ");
         transcriptInput!.value = "different words";
         transcriptInput!.dispatchEvent(new Event("input", { bubbles: true }));
         expect(onTranscriptSearchChange).toHaveBeenCalledWith("different words");
         expect(onTranscriptSearch).not.toHaveBeenCalled();
+        container
+          .querySelector(".sessions-transcript-search__form")
+          ?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+        expect(onTranscriptSearch).toHaveBeenCalledTimes(1);
       } else {
-        expect(container.textContent).toContain("Transcript search requires a newer Gateway.");
+        expect(transcriptTrigger?.closest("openclaw-tooltip")).toBeNull();
       }
-
-      container
-        .querySelector(".sessions-transcript-search__form")
-        ?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
       expect(onTranscriptSearch).toHaveBeenCalledTimes(available ? 1 : 0);
     },
   );
 
+  it("removes the connection explanation when transcript search becomes available", async () => {
+    const container = document.createElement("div");
+    const props = buildProps(buildMultiResult([]));
+    renderSessionsView({ ...props, transcriptSearchAvailable: false }, container);
+    await Promise.resolve();
+    expect(container.querySelector('.settings-section__desc [role="status"]')?.textContent).toBe(
+      "Connect to the Gateway to search transcripts.",
+    );
+
+    renderSessionsView({ ...props, transcriptSearchAvailable: true }, container);
+    await Promise.resolve();
+    expect(container.querySelector('.settings-section__desc [role="status"]')).toBeNull();
+    expect(
+      container.querySelector<HTMLButtonElement>(".sessions-transcript-search__trigger")?.disabled,
+    ).toBe(false);
+  });
+
   it("renders transcript provenance and opens the matching session", async () => {
     const container = document.createElement("div");
     const onNavigateToChat = vi.fn();
-    render(
-      renderSessions({
+    renderSessionsView(
+      {
         ...buildProps(
           buildMultiResult([
             {
@@ -86,7 +121,7 @@ describe("sessions transcript search view", () => {
           archivedTranscriptsExcluded: 0,
         },
         onNavigateToChat,
-      }),
+      },
       container,
     );
     await Promise.resolve();
@@ -126,11 +161,14 @@ describe("Sessions query clearing", () => {
       };
       const onSearchChange = vi.fn((query: string) => {
         props.searchQuery = query;
-        render(renderSessions({ ...props, onSearchChange }), container);
+        renderSessionsView({ ...props, onSearchChange }, container);
       });
       try {
-        render(renderSessions({ ...props, onSearchChange }), container);
-        const input = container.querySelector<HTMLInputElement>(".sessions-toolbar__search input")!;
+        renderSessionsView({ ...props, onSearchChange }, container);
+        container.querySelector<HTMLButtonElement>(".sessions-filter-popover__trigger")!.click();
+        const input = container.querySelector<HTMLInputElement>(
+          ".sessions-filter-popover__search input",
+        )!;
         expect(input.getAttribute("aria-label")).toBe("Filter by key, agent, label, kind…");
         const clear = container.querySelector<HTMLButtonElement>(
           'button[aria-label="Clear search"]',
@@ -171,7 +209,10 @@ describe("Sessions query clearing", () => {
           cancelable: true,
         });
         input.dispatchEvent(emptyEscape);
-        expect(emptyEscape.defaultPrevented).toBe(false);
+        expect(emptyEscape.defaultPrevented).toBe(true);
+        expect(container.querySelector(".sessions-filter-popover")?.matches(":popover-open")).toBe(
+          false,
+        );
         expect(onSearchChange).toHaveBeenCalledTimes(1);
         container.querySelector<HTMLButtonElement>(".data-table-empty-state button")!.click();
         expect(props.onClearFilters).toHaveBeenCalledOnce();
@@ -196,9 +237,13 @@ describe("Sessions query clearing", () => {
     const onSearchChange = vi.fn();
     const props = { ...buildProps(buildMultiResult([])), searchQuery: "keep me", onSearchChange };
     let overlay: HTMLElement | undefined;
+    let overlayOwner: Overlay | undefined;
     try {
-      render(renderSessions(props), container);
-      const input = container.querySelector<HTMLInputElement>(".sessions-toolbar__search input")!;
+      renderSessionsView(props, container);
+      container.querySelector<HTMLButtonElement>(".sessions-filter-popover__trigger")!.click();
+      const input = container.querySelector<HTMLInputElement>(
+        ".sessions-filter-popover__search input",
+      )!;
       if (owner !== "unfocused") {
         input.focus();
       }
@@ -207,7 +252,13 @@ describe("Sessions query clearing", () => {
         document.body.append(overlay);
       }
       if (owner === "popover") {
-        container.querySelector("wa-popover")!.setAttribute("open", "");
+        overlay = document.createElement("div");
+        overlay.popover = "manual";
+        document.body.append(overlay);
+        overlayOwner = createOverlay("sessions-search-test", undefined, { dismissEscape: false });
+        overlayOwner.bindSurface(overlay);
+        overlayOwner.bindTrigger(input);
+        expect(overlayOwner.request(true, "none")).toBe(true);
       }
       if (owner === "modal") {
         overlay = document.createElement("dialog");
@@ -228,9 +279,12 @@ describe("Sessions query clearing", () => {
       input.dispatchEvent(event);
       expect(onSearchChange).not.toHaveBeenCalled();
       expect(input.value).toBe("keep me");
-      expect(event.defaultPrevented).toBe(owner === "prevented");
+      if (owner === "prevented") {
+        expect(event.defaultPrevented).toBe(true);
+      }
     } finally {
-      container.querySelector("wa-popover")?.removeAttribute("open");
+      overlayOwner?.dispose();
+      overlay?.removeAttribute("open");
       overlay?.remove();
       container.remove();
     }

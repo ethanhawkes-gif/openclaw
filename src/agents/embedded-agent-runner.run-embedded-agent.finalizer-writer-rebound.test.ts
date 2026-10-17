@@ -249,6 +249,8 @@ let SessionManager: typeof import("./sessions/session-manager.js").SessionManage
 let replaceSessionEntry: typeof import("../config/sessions/session-accessor.js").replaceSessionEntry;
 let loadSessionEntryReadOnly: typeof import("../config/sessions/session-accessor.js").loadSessionEntryReadOnly;
 let readMessages: typeof import("../plugin-sdk/session-transcript-runtime.js").readVisibleSessionTranscriptMessageEntries;
+let setRuntimeConfigSnapshot: typeof import("../config/config.js").setRuntimeConfigSnapshot;
+let clearRuntimeConfigSnapshot: typeof import("../config/config.js").clearRuntimeConfigSnapshot;
 
 beforeAll(async () => {
   vi.useRealTimers();
@@ -349,6 +351,7 @@ beforeAll(async () => {
       async <Model>(params: { model?: Model }): Promise<Model | undefined> => params.model,
     ),
   }));
+  ({ clearRuntimeConfigSnapshot, setRuntimeConfigSnapshot } = await import("../config/config.js"));
   ({ runEmbeddedAgent } = await import("./embedded-agent-runner/run.js"));
   ({ prepareSystemAgentRunAdmission } = await import("./admitted-run-context.js"));
   ({ SessionManager } = await import("./sessions/session-manager.js"));
@@ -356,6 +359,10 @@ beforeAll(async () => {
     await import("../config/sessions/session-accessor.js"));
   ({ readVisibleSessionTranscriptMessageEntries: readMessages } =
     await import("../plugin-sdk/session-transcript-runtime.js"));
+});
+
+afterAll(() => {
+  clearRuntimeConfigSnapshot();
 });
 
 beforeEach(() => {
@@ -377,6 +384,7 @@ async function createBorrowedCustodyFixture(runId = "review-run") {
   config.agents.defaults ??= {};
   config.agents.defaults.sessionStore = { agentId: "test" };
   config.session = { store: path.join(agentDir, "openclaw-agent.sqlite") };
+  setRuntimeConfigSnapshot(config);
 
   const privateSessionId = "internal-session-effects-review-run-0123456789abcdef";
   const privateSessionKey = "agent:test:internal-session-effects:review-run-0123456789abcdef";
