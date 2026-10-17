@@ -151,7 +151,7 @@ it.each([
       }
       if (mode === "session-replaced") {
         await replaceSessionEntry(
-          { agentId: "main", sessionId: entry.sessionId, sessionKey, storePath: database.path },
+          { agentId: "main", sessionKey, storePath: database.path },
           { ...entry, lifecycleRevision: "replacement" },
         );
       }
